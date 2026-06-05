@@ -1,0 +1,3995 @@
+import threading, time, requests, urllib.parse, socket, ctypes, base64, json, re, traceback, ssl, hashlib
+import os
+from html import unescape
+
+from base_plugin import BasePlugin, MenuItemData, MenuItemType, MethodHook
+from android_utils import log, run_on_ui_thread
+from ui.settings import Header, Switch, Text, Divider, Input
+from ui.bulletin import BulletinHelper
+from ui.alert import AlertDialogBuilder
+from hook_utils import find_class, get_private_field, set_private_field
+from client_utils import get_last_fragment
+from android.os import Build
+from android.provider import Settings
+from org.telegram.messenger import (
+    ApplicationLoader, SharedConfig, MessagesController,
+    NotificationCenter, UserConfig,
+)
+from org.telegram.tgnet import ConnectionsManager
+
+__id__ = "bobrsocks"
+__name__ = "vless-tg"
+__description__ = "VLESS/VMess/Trojan/SS прокси для Telegram"
+__icon__ = "exitFy/0"
+__author__ = "nrf24l01"
+__version__ = "4.1.0"
+__min_version__ = "12.1.1"
+
+LIBXRAY_RELEASE_API_URL = "https://api.github.com/repos/nrf24l01/extragram-xray-plugin/releases/tags/libxray-latest"
+LIBXRAY_FALLBACK_URL = "https://github.com/nrf24l01/extragram-xray-plugin/releases/download/libxray-latest/libxray.so"
+LIBXRAY_MIN_SIZE = 1024 * 1024
+
+VLESS_READY_WAIT_SEC = 4.0
+VLESS_READY_POLL_SEC = 0.1
+HEALTH_CHECK_INTERVAL_SEC = 15.0
+HEALTH_CHECK_FAIL_THRESHOLD = 2
+PROFILE_RECHECK_INTERVAL_SEC_DEFAULT = 60.0
+PROFILE_RECHECK_INTERVAL_SEC_MIN = 10.0
+PROXY_CHECK_URLS = (
+    "https://api.ipify.org/",
+    "https://ifconfig.me/ip",
+    "https://www.cloudflare.com/cdn-cgi/trace",
+)
+_PROXY_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://")
+MAIN_SETTINGS_ENTRY_TAG = "bobrsocks_main_settings_entry"
+PROXY_SETTINGS_ENTRY_TAG = "bobrsocks_proxy_settings_entry"
+PLUGIN_SETTINGS_CARD_TAG = "bobrsocks_plugin_settings_card"
+_DEBUG_LOG_MAX = 300
+_DEBUG_LOG_LOCK = threading.Lock()
+_DEBUG_LOG_RING = []
+
+T = {
+    "settings_header":      "Настройки vless-tg",
+    "enable_plugin":        "Включить VLESS",
+    "open_tg_settings":     "Настройки прокси Telegram",
+    "menu_settings":        "Настройки vless-tg",
+    "vless_nodes_header":   "Серверы",
+    "vless_quick_actions":  "Быстрое подключение",
+    "vless_add_key":        "VLESS: вставить из буфера",
+    "vless_add_sub":        "Ссылка на подписку",
+    "vless_paste_hint":     "Скопируйте ключ VLESS/VMess/Trojan/SS и нажмите первую кнопку",
+    "vless_quick_desc":     "Скопируйте ключ, вставьте его из буфера или сразу откройте прокси Telegram",
+    "vless_proxy_short_hint": "Для Telegram выберите адрес 127.0.0.1",
+    "vless_no_nodes":       "Добавьте ключ или подписку",
+    "vless_nodes_manage":   "Управление серверами",
+    "vless_nodes_update":   "Обновить серверы",
+    "vless_nodes_clear":    "Очистить серверы",
+    "vless_sub_update":     "Обновить подписку",
+    "vless_sub_rename":     "Переименовать подписку",
+    "vless_sub_delete":     "Удалить подписку",
+    "vless_sub_delete_confirm": "Удалить эту подписку?",
+    "vless_sub_rename_title": "Новое имя подписки",
+    "vless_sub_manage":     "Управление подпиской",
+    "vless_node_default":   "Сервер VLESS",
+    "addon_download_title": "Xray-core",
+    "addon_downloading":    "Скачивание официального Xray-core...",
+    "addon_download_source": "Источник: {url}",
+    "addon_download_error": "Ошибка скачивания",
+    "addon_download_done":  "Xray-core обновлён",
+    "addon_delete":         "Удалить ядро",
+    "addon_delete_title":   "Удалить ядро?",
+    "addon_delete_msg":     "Xray-core будет удалён.",
+    "btn_delete":           "Удалить",
+    "btn_cancel":           "Отмена",
+    "addon_delete_error":   "Ошибка удаления",
+    "vless_no_core_msg":    "Нет официального Xray-core.\nНажмите кнопку ниже, чтобы скачать.",
+    "vless_download_addon": "Скачать Xray-core",
+    "vless_update_addon":   "Обновить Xray-core",
+    "settings_error":       "Ошибка настроек",
+    "vless_custom_sub_err": "Ошибка подписки",
+    "vless_custom_sub_empty": "Подписка не содержит серверов",
+    "vless_custom_sub_bad": "Неверная ссылка подписки",
+    "vless_app_not_supported": "Приложение не поддерживается",
+    "update_available":     "Обновить плагин (v{ver})",
+    "update_check_btn":     "Проверить обновления",
+    "update_downloading":   "Обновление плагина...",
+    "update_done":          "Обновлено до v{ver}. Перезагрузите плагин.",
+    "update_error":         "Ошибка обновления",
+    "update_no_updates":    "Обновлений нет (v{ver})",
+    "update_checking":      "Проверка...",
+    "node_connect":         "Подключить",
+    "node_disconnect":      "Отключить",
+    "node_rename":          "Переименовать",
+    "node_delete":          "Удалить сервер",
+    "node_delete_confirm":  "Удалить этот сервер?",
+    "node_rename_title":    "Новое имя сервера",
+    "node_actions":         "Действия",
+    "clipboard_found":      "Найден VLESS ключ",
+    "clipboard_add":        "Добавить в плагин?",
+    "btn_add":              "Добавить",
+    "key_added":            "Ключ добавлен",
+    "keys_added":           "Добавлено серверов: {count}",
+    "clipboard_found_multi": "Найдены ключи ({count})",
+    "clipboard_empty":      "В буфере нет ключа VLESS/VMess/Trojan/SS",
+    "tg_settings_vless":    "Управление VLESS",
+    "tg_settings_vless_desc": "Открыть настройки плагина vless-tg",
+    "proxy_hint":           "Прокси: 127.0.0.1",
+    "proxy_hint_full":      "В настройках прокси Telegram\nвыберите адрес 127.0.0.1",
+    "auto_switch":          "Автопереключение серверов",
+    "auto_switch_desc":     "Переключаться на лучший сервер при недоступности",
+    "auto_switch_notify":   "Автопереключение на: {name}",
+    "debug_logs_header":    "Диагностика",
+    "debug_show_logs":      "Показать логи плагина",
+    "debug_copy_logs":      "Скопировать логи",
+    "debug_clear_logs":     "Очистить логи",
+    "debug_logs_empty":     "Логи пока пустые",
+    "debug_logs_copied":    "Логи скопированы",
+    "debug_tunnel_probe":   "Проверить туннель сейчас",
+    "debug_tunnel_ok":      "Туннель OK",
+    "debug_tunnel_fail":    "Туннель не работает: {reason}",
+    "profile_recheck_interval": "Интервал recheck (сек)",
+}
+
+def Z(key):
+    return T.get(key, key)
+
+def _to_int(v, d=0):
+    try: return int(v)
+    except: return int(d)
+
+def _is_emoji_char(ch):
+    try:
+        cp = ord(ch)
+    except:
+        return False
+    if cp in (0x200D, 0xFE0E, 0xFE0F):
+        return True
+    if 0x1F1E6 <= cp <= 0x1F1FF:
+        return True
+    if 0x1F300 <= cp <= 0x1FAFF:
+        return True
+    if 0x2600 <= cp <= 0x27BF:
+        return True
+    return False
+
+def _clean_vless_name(raw_name):
+    try:
+        s = str(raw_name or "")
+    except:
+        s = ""
+    try:
+        s = urllib.parse.unquote(s)
+    except:
+        pass
+    out = []
+    for ch in s:
+        if _is_emoji_char(ch):
+            continue
+        out.append(ch)
+    s = "".join(out).strip()
+    try:
+        s = re.sub(r"\s{2,}", " ", s)
+    except:
+        pass
+    if not s:
+        s = Z("vless_node_default")
+    return s
+
+def _is_proxy_uri(s):
+    return any(str(s).startswith(scheme) for scheme in _PROXY_SCHEMES)
+
+def _find_proxy_scheme(s):
+    for scheme in _PROXY_SCHEMES:
+        idx = s.find(scheme)
+        if idx >= 0:
+            return scheme, idx
+    return None, -1
+
+def _sanitize_vless_uri(raw_uri):
+    try:
+        s = str(raw_uri or "")
+    except:
+        return ""
+    try:
+        s = unescape(s)
+    except:
+        pass
+    s = s.replace("\n", "").replace("\r", "").strip()
+    if not s:
+        return ""
+
+    try:
+        scheme, idx = _find_proxy_scheme(s)
+        if scheme and idx > 0:
+            s = s[idx:]
+    except:
+        pass
+
+    try:
+        s = re.sub(r"[\s\)\]>,\.;]+$", "", s)
+    except:
+        pass
+
+    if not _is_proxy_uri(s):
+        return s
+    # vmess:// uses base64, don't touch fragment
+    if s.startswith("vmess://"):
+        return s
+    if "#" not in s:
+        return s
+
+    base, frag = s.split("#", 1)
+    clean = _clean_vless_name(frag)
+    if not clean or clean == Z("vless_node_default"):
+        return base
+    try:
+        return base + "#" + urllib.parse.quote(clean, safe="-._~")
+    except:
+        return base
+
+def _extract_proxy_uris(text):
+    try:
+        s = str(text or "")
+    except:
+        return []
+    try:
+        links = re.findall(r"(?:vless|vmess|trojan|ss)://[^\s<>\"']+", s)
+    except:
+        return []
+    result = []
+    seen = set()
+    for raw in links:
+        try:
+            uri = _sanitize_vless_uri(raw)
+            if not uri or not _is_proxy_uri(uri) or len(uri) < 15:
+                continue
+            if not uri.startswith("vmess://") and "@" not in uri:
+                continue
+            if uri in seen:
+                continue
+            seen.add(uri)
+            result.append(uri)
+        except:
+            continue
+    return result
+
+def _set_tg_proxy_enabled(enabled):
+    try:
+        ed = MessagesController.getGlobalMainSettings().edit()
+        ed.putBoolean("proxy_enabled", bool(enabled)); ed.commit()
+    except: pass
+    try: SharedConfig.proxyEnabled = bool(enabled); SharedConfig.saveConfig()
+    except: pass
+    try:
+        for ac in range(UserConfig.MAX_ACCOUNT_COUNT):
+            try:
+                cm = ConnectionsManager.getInstance(ac)
+                if cm:
+                    if bool(enabled) and SharedConfig.currentProxy is not None:
+                        p = SharedConfig.currentProxy
+                        cm.setProxySettings(True, p.address, int(p.port), p.username, p.password, p.secret)
+                    else:
+                        cm.setProxySettings(False, "", 0, "", "", "")
+            except: pass
+    except: pass
+    try: NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.proxySettingsChanged)
+    except: pass
+
+def _log(msg):
+    line = f"[bobrsocks] {msg}"
+    try:
+        stamp = time.strftime("%H:%M:%S")
+        with _DEBUG_LOG_LOCK:
+            _DEBUG_LOG_RING.append(f"{stamp} {msg}")
+            if len(_DEBUG_LOG_RING) > _DEBUG_LOG_MAX:
+                del _DEBUG_LOG_RING[0:len(_DEBUG_LOG_RING) - _DEBUG_LOG_MAX]
+    except:
+        pass
+    log(line)
+
+def _get_debug_logs(limit=120):
+    try:
+        lim = int(limit)
+    except:
+        lim = 120
+    if lim <= 0:
+        lim = 120
+    try:
+        with _DEBUG_LOG_LOCK:
+            data = list(_DEBUG_LOG_RING[-lim:])
+    except:
+        data = []
+    return data
+
+def _clear_debug_logs():
+    try:
+        with _DEBUG_LOG_LOCK:
+            _DEBUG_LOG_RING[:] = []
+    except:
+        pass
+
+def _log_exc(prefix):
+    try:
+        tb = traceback.format_exc()
+    except:
+        tb = "<no traceback>"
+    try:
+        _log(f"{prefix}: {tb}")
+    except:
+        pass
+
+class VlessConfigParser:
+    @staticmethod
+    def _build_stream(params):
+        net = str(params.get("type", "tcp") or "tcp").lower()
+        security = str(params.get("security", "none") or "none").lower()
+        fp = str(params.get("fp", "chrome") or "chrome").strip().lower()
+        if fp in ("randomized", "random", "rand"):
+            fp = "chrome"
+        stream = {"network": net, "security": security}
+
+        if security == "reality":
+            stream["realitySettings"] = {
+                "show": False, "fingerprint": fp,
+                "serverName": params.get("sni", ""),
+                "publicKey": params.get("pbk", ""),
+                "shortId": params.get("sid", ""),
+                "spiderX": params.get("spx", ""),
+            }
+        elif security == "tls":
+            tls = {"serverName": params.get("sni", ""), "allowInsecure": False, "fingerprint": fp}
+            alpn = params.get("alpn", "")
+            if alpn:
+                alpn_list = [str(x).strip() for x in str(alpn).split(",") if str(x).strip()]
+                # h3 is QUIC-only and can break TLS-over-TCP endpoints.
+                alpn_list = [x for x in alpn_list if str(x).lower() != "h3"]
+                if alpn_list:
+                    tls["alpn"] = alpn_list
+            stream["tlsSettings"] = tls
+
+        if net == "ws":
+            stream["wsSettings"] = {
+                "path": params.get("path", "/"),
+                "headers": {"Host": params.get("host", params.get("sni", ""))},
+            }
+        elif net == "grpc":
+            stream["grpcSettings"] = {
+                "serviceName": params.get("serviceName", ""),
+                "multiMode": params.get("mode", "multi") == "multi",
+            }
+        elif net in ("h2", "http"):
+            host = params.get("host", params.get("sni", ""))
+            stream["httpSettings"] = {
+                "path": params.get("path", "/"),
+                "host": [host] if host else [],
+            }
+        elif net in ("kcp", "mkcp"):
+            stream["kcpSettings"] = {
+                "header": {"type": params.get("headerType", "none")},
+                "seed": params.get("seed", ""),
+            }
+        elif net in ("xhttp", "splithttp"):
+            stream["xhttpSettings"] = {
+                "path": params.get("path", "/"),
+                "host": params.get("host", params.get("sni", "")),
+            }
+        elif net == "httpupgrade":
+            stream["httpupgradeSettings"] = {
+                "path": params.get("path", "/"),
+                "host": params.get("host", params.get("sni", "")),
+            }
+        return stream
+
+    @staticmethod
+    def _base_config(local_port):
+        return {
+            "log": {"loglevel": "warning"},
+            "dns": {"servers": ["1.1.1.1", "8.8.8.8"]},
+            "inbounds": [{"tag": "socks-in", "port": local_port, "listen": "127.0.0.1",
+                          "protocol": "socks",
+                          "settings": {"auth": "noauth", "udp": True}}],
+            "outbounds": [
+                {"tag": "proxy"},
+                {"tag": "direct", "protocol": "freedom", "settings": {}},
+            ],
+        }
+
+    @staticmethod
+    def _parse_std_uri(uri_str):
+        name = Z("vless_node_default")
+        if "#" in uri_str:
+            uri_str, frag = uri_str.split("#", 1)
+            name = _clean_vless_name(frag)
+            if not name:
+                name = Z("vless_node_default")
+        scheme_end = uri_str.find("://")
+        if scheme_end < 0:
+            return None
+        body = uri_str[scheme_end + 3:]
+        if "@" not in body:
+            return None
+        user_info, rest = body.split("@", 1)
+        if "?" in rest:
+            host_port, params_raw = rest.split("?", 1)
+        else:
+            host_port, params_raw = rest, ""
+        host_port = str(host_port).strip().rstrip("/")
+        if ":" not in host_port:
+            return None
+        host, port_str = host_port.split(":", 1)
+        try:
+            port = int(str(port_str).strip())
+        except:
+            return None
+        params = {}
+        if params_raw:
+            for pair in params_raw.split("&"):
+                if "=" in pair:
+                    k, v = pair.split("=", 1)
+                    params[k] = urllib.parse.unquote(v)
+        return {"user": user_info, "host": host, "port": port, "params": params, "name": name}
+
+    @staticmethod
+    def parse(uri_str, local_port):
+        try:
+            uri_str = _sanitize_vless_uri(uri_str)
+            if uri_str.startswith("vless://"):
+                return VlessConfigParser._parse_vless(uri_str, local_port)
+            elif uri_str.startswith("vmess://"):
+                return VlessConfigParser._parse_vmess(uri_str, local_port)
+            elif uri_str.startswith("trojan://"):
+                return VlessConfigParser._parse_trojan(uri_str, local_port)
+            elif uri_str.startswith("ss://"):
+                return VlessConfigParser._parse_ss(uri_str, local_port)
+            return None, None
+        except Exception as e:
+            _log(f"config parse error: {e}")
+            return None, None
+
+    @staticmethod
+    def _parse_vless(uri_str, local_port):
+        r = VlessConfigParser._parse_std_uri(uri_str)
+        if not r:
+            return None, None
+        uuid_str = r["user"]
+        params = r["params"]
+        flow = params.get("flow", "")
+        users = [{"id": uuid_str, "encryption": "none"}]
+        if flow:
+            users[0]["flow"] = flow
+        config = VlessConfigParser._base_config(local_port)
+        config["outbounds"][0].update({
+            "protocol": "vless",
+            "settings": {"vnext": [{"address": r["host"], "port": r["port"], "users": users}]},
+            "streamSettings": VlessConfigParser._build_stream(params),
+        })
+        return json.dumps(config), r["name"]
+
+    @staticmethod
+    def _parse_vmess(uri_str, local_port):
+        try:
+            b64_part = uri_str[8:]
+            if "#" in b64_part:
+                b64_part = b64_part.split("#", 1)[0]
+            b64_part = b64_part.strip()
+            b64_part = b64_part.replace("-", "+").replace("_", "/")
+            missing = len(b64_part) % 4
+            if missing:
+                b64_part += "=" * (4 - missing)
+            raw = base64.b64decode(b64_part, validate=False)
+            obj = json.loads(raw.decode("utf-8", errors="ignore"))
+        except Exception as e:
+            _log(f"vmess base64/json decode error: {e}")
+            return None, None
+
+        name = _clean_vless_name(obj.get("ps", ""))
+        if not name:
+            name = Z("vless_node_default")
+        host = obj.get("add", "")
+        try:
+            port = int(obj.get("port", 0))
+        except:
+            return None, None
+        if not host or not port:
+            return None, None
+
+        uuid_str = obj.get("id", "")
+        aid = _to_int(obj.get("aid", 0), 0)
+        scy = obj.get("scy", "auto") or "auto"
+
+        users = [{"id": uuid_str, "alterId": aid, "security": scy}]
+
+        net = obj.get("net", "tcp") or "tcp"
+        tls_val = obj.get("tls", "") or ""
+        sni = obj.get("sni", "") or ""
+        fp_val = obj.get("fp", "chrome") or "chrome"
+        alpn_val = obj.get("alpn", "") or ""
+        path_val = obj.get("path", "/") or "/"
+        host_val = obj.get("host", "") or ""
+        header_type = obj.get("type", "none") or "none"
+
+        params = {
+            "type": net,
+            "security": "tls" if tls_val == "tls" else "none",
+            "sni": sni or host_val,
+            "fp": fp_val,
+            "alpn": alpn_val,
+            "path": path_val,
+            "host": host_val or sni,
+            "headerType": header_type,
+            "serviceName": obj.get("path", ""),
+            "seed": obj.get("path", ""),
+        }
+
+        config = VlessConfigParser._base_config(local_port)
+        config["outbounds"][0].update({
+            "protocol": "vmess",
+            "settings": {"vnext": [{"address": host, "port": port, "users": users}]},
+            "streamSettings": VlessConfigParser._build_stream(params),
+        })
+        return json.dumps(config), name
+
+    @staticmethod
+    def _parse_trojan(uri_str, local_port):
+        r = VlessConfigParser._parse_std_uri(uri_str)
+        if not r:
+            return None, None
+        password = urllib.parse.unquote(r["user"])
+        params = r["params"]
+        if not params.get("security"):
+            params["security"] = "tls"
+        if not params.get("sni"):
+            params["sni"] = r["host"]
+
+        config = VlessConfigParser._base_config(local_port)
+        config["outbounds"][0].update({
+            "protocol": "trojan",
+            "settings": {"servers": [{"address": r["host"], "port": r["port"], "password": password}]},
+            "streamSettings": VlessConfigParser._build_stream(params),
+        })
+        return json.dumps(config), r["name"]
+
+    @staticmethod
+    def _parse_ss(uri_str, local_port):
+        try:
+            body = uri_str[5:]
+            name = Z("vless_node_default")
+            if "#" in body:
+                body, frag = body.split("#", 1)
+                name = _clean_vless_name(frag)
+                if not name:
+                    name = Z("vless_node_default")
+            body = body.strip()
+
+            method = ""
+            password = ""
+            host = ""
+            port = 0
+
+            if "@" in body:
+                user_part, server_part = body.split("@", 1)
+                server_part = server_part.split("?", 1)[0].strip().rstrip("/")
+                try:
+                    user_part = user_part.replace("-", "+").replace("_", "/")
+                    miss = len(user_part) % 4
+                    if miss:
+                        user_part += "=" * (4 - miss)
+                    decoded = base64.b64decode(user_part, validate=False).decode("utf-8", errors="ignore")
+                    if ":" in decoded:
+                        method, password = decoded.split(":", 1)
+                    else:
+                        method = decoded
+                except:
+                    if ":" in user_part:
+                        method, password = user_part.split(":", 1)
+                    else:
+                        return None, None
+                if ":" not in server_part:
+                    return None, None
+                host, port_str = server_part.rsplit(":", 1)
+                try:
+                    port = int(port_str)
+                except:
+                    return None, None
+            else:
+                try:
+                    b64 = body.replace("-", "+").replace("_", "/")
+                    miss = len(b64) % 4
+                    if miss:
+                        b64 += "=" * (4 - miss)
+                    decoded = base64.b64decode(b64, validate=False).decode("utf-8", errors="ignore")
+                    if "@" not in decoded or ":" not in decoded:
+                        return None, None
+                    user_part, server_part = decoded.split("@", 1)
+                    if ":" in user_part:
+                        method, password = user_part.split(":", 1)
+                    if ":" in server_part:
+                        host, port_str = server_part.rsplit(":", 1)
+                        port = int(port_str)
+                except:
+                    return None, None
+
+            if not method or not host or not port:
+                return None, None
+
+            config = VlessConfigParser._base_config(local_port)
+            config["outbounds"][0].update({
+                "protocol": "shadowsocks",
+                "settings": {"servers": [{"address": host, "port": port,
+                                          "method": method, "password": password}]},
+                "streamSettings": {"network": "tcp", "security": "none"},
+            })
+            return json.dumps(config), name
+        except Exception as e:
+            _log(f"ss parse error: {e}")
+            return None, None
+
+class VlessCore:
+    def __init__(self):
+        self.lib = None
+        self.mode = None
+        self.libc = None
+        self.lib_path = self._libxray_path()
+
+        self._try_init_standalone()
+
+    def _modules_dir(self):
+        ctx = ApplicationLoader.applicationContext
+        try:
+            base_dir = str(ctx.getCodeCacheDir())
+        except:
+            base_dir = str(ctx.getFilesDir())
+        dir_path = os.path.join(base_dir, "exitfy_modules")
+        if not os.path.exists(dir_path):
+            os.makedirs(dir_path)
+        try: os.chmod(dir_path, 0o700)
+        except: pass
+        return dir_path
+
+    def _libxray_path(self):
+        try:
+            return os.path.join(self._modules_dir(), "libxray.so")
+        except:
+            return None
+
+    def _old_libxray_path(self):
+        try:
+            ctx = ApplicationLoader.applicationContext
+            return os.path.join(str(ctx.getFilesDir()), "exitfy_modules", "libxray.so")
+        except:
+            return None
+
+    def _migrate_old_libxray(self, new_path):
+        try:
+            old_path = self._old_libxray_path()
+            if not new_path or not old_path or new_path == old_path:
+                return False
+            if os.path.exists(new_path) and os.path.getsize(new_path) >= LIBXRAY_MIN_SIZE:
+                return True
+            if not os.path.exists(old_path) or os.path.getsize(old_path) < LIBXRAY_MIN_SIZE:
+                return False
+            with open(old_path, "rb") as src, open(new_path + ".migrate", "wb") as dst:
+                while True:
+                    chunk = src.read(65536)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+            try: os.chmod(new_path + ".migrate", 0o600)
+            except: pass
+            os.rename(new_path + ".migrate", new_path)
+            try: os.remove(old_path)
+            except: pass
+            _log(f"libxray migrated to modules dir: {new_path}")
+            return True
+        except Exception as e:
+            _log(f"libxray migrate error: {e}")
+            return False
+
+    def _try_init_standalone(self):
+        try:
+            lib_path = self._libxray_path()
+            self._migrate_old_libxray(lib_path)
+            if (not lib_path) or (not os.path.exists(lib_path)) or (os.path.getsize(lib_path) < LIBXRAY_MIN_SIZE):
+                return
+            linker = _NativeLinker()
+            lib = linker.load(lib_path)
+            if not lib:
+                return
+            lib.StartCore.argtypes = [ctypes.c_char_p]
+            lib.StartCore.restype = ctypes.c_void_p
+            lib.StopCore.argtypes = []
+            lib.StopCore.restype = None
+            try:
+                lib.FreeCString.argtypes = [ctypes.c_void_p]
+                lib.FreeCString.restype = None
+            except:
+                pass
+            self.lib = lib
+            self.lib_path = lib_path
+            self.mode = "libxray"
+            try:
+                self.libc = ctypes.CDLL("libc.so")
+                self.libc.free.argtypes = [ctypes.c_void_p]
+                self.libc.free.restype = None
+            except:
+                self.libc = None
+        except Exception as e:
+            _log(f"libxray init failed: {e}")
+            return
+
+    def is_available(self): return self.lib is not None
+
+    def start(self, config_json):
+        if not self.is_available(): return "libxray.so not loaded"
+        try:
+            self.stop()
+            _log(f"VlessCore.start: calling StartCore config_len={len(config_json)}")
+            res_ptr = self.lib.StartCore(config_json.encode("utf-8"))
+            if not res_ptr:
+                return ""
+            try:
+                res_str = ctypes.cast(res_ptr, ctypes.c_char_p).value
+                out = res_str.decode("utf-8", errors="ignore") if res_str else ""
+            except:
+                out = ""
+            try:
+                if hasattr(self.lib, "FreeCString"):
+                    self.lib.FreeCString(res_ptr)
+                elif self.libc:
+                    self.libc.free(res_ptr)
+            except:
+                pass
+            return out
+        except Exception as e:
+            _log(f"VlessCore.start: exception: {e}")
+            return str(e)
+
+    def stop(self):
+        if self.is_available():
+            try: self.lib.StopCore()
+            except: pass
+
+class _NativeLinker:
+    def __init__(self):
+        self.libdl = ctypes.CDLL("libdl.so")
+        try:
+            self.open_ext = self.libdl.android_dlopen_ext
+            class Info(ctypes.Structure):
+                _fields_ = [
+                    ("flags", ctypes.c_uint64),
+                    ("reserved_addr", ctypes.c_void_p),
+                    ("reserved_size", ctypes.c_size_t),
+                    ("relro_fd", ctypes.c_int),
+                    ("library_fd", ctypes.c_int),
+                    ("library_fd_offset", ctypes.c_uint64),
+                    ("library_namespace", ctypes.c_void_p),
+                ]
+            self.Info = Info
+            self.open_ext.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(self.Info)]
+            self.open_ext.restype = ctypes.c_void_p
+        except:
+            self.open_ext = None
+
+    def load(self, path: str):
+        if not os.path.exists(path):
+            return None
+        try:
+            if int(Build.VERSION.SDK_INT) >= 29 and self.open_ext:
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    info = self.Info(flags=0x10, library_fd=fd)
+                    h = self.open_ext(path.encode(), 2 | 0x100, ctypes.byref(info))
+                    if h:
+                        return ctypes.CDLL(path, handle=h)
+                finally:
+                    try: os.close(fd)
+                    except: pass
+        except:
+            pass
+        try:
+            return ctypes.CDLL(path, mode=2 | 0x100)
+        except:
+            return None
+
+def _vless_apply_tg_proxy(port, enable):
+    try:
+        port = int(port) if enable else 0
+        _log(f"vless_apply_tg_proxy: start enable={enable} port={port}")
+
+        try:
+            SharedConfig.loadProxyList()
+        except:
+            pass
+
+        local_proxy = None
+        try:
+            if hasattr(SharedConfig, "proxyList") and SharedConfig.proxyList:
+                duplicates = []
+                for i in range(SharedConfig.proxyList.size()):
+                    try:
+                        p = SharedConfig.proxyList.get(i)
+                        if str(p.address) == "127.0.0.1":
+                            if local_proxy is None:
+                                local_proxy = p
+                            else:
+                                duplicates.append(p)
+                    except:
+                        continue
+                for p in duplicates:
+                    try:
+                        SharedConfig.deleteProxy(p)
+                    except:
+                        pass
+        except:
+            pass
+
+        if enable:
+            if local_proxy:
+                try:
+                    local_proxy.port = port
+                    local_proxy.username = ""
+                    local_proxy.password = ""
+                    local_proxy.secret = ""
+                except:
+                    pass
+                proxy_obj = local_proxy
+            else:
+                proxy_obj = None
+                try:
+                    proxy_obj = SharedConfig.addProxy("127.0.0.1", port, "", "", "")
+                    _log(f"vless_apply_tg_proxy: addProxy returned {type(proxy_obj)}")
+                except Exception as e:
+                    _log(f"vless_apply_tg_proxy: addProxy(raw) failed: {e}")
+                if not proxy_obj:
+                    try:
+                        ProxyInfoClass = find_class("org.telegram.messenger.SharedConfig$ProxyInfo")
+                        if ProxyInfoClass:
+                            proxy_obj = ProxyInfoClass("127.0.0.1", port, "", "", "")
+                            try:
+                                SharedConfig.addProxy(proxy_obj)
+                            except:
+                                pass
+                        _log(f"vless_apply_tg_proxy: find_class fallback proxy_obj={proxy_obj is not None}")
+                    except Exception as e:
+                        _log(f"vless_apply_tg_proxy: find_class fallback failed: {e}")
+
+            try:
+                if proxy_obj:
+                    SharedConfig.currentProxy = proxy_obj
+                    _log("vless_apply_tg_proxy: currentProxy set")
+            except:
+                pass
+
+            try:
+                SharedConfig.proxyEnabled = True
+            except:
+                pass
+
+            try:
+                ed = MessagesController.getGlobalMainSettings().edit()
+                ed.putString("proxy_ip", "127.0.0.1")
+                ed.putInt("proxy_port", port)
+                ed.putString("proxy_user", "")
+                ed.putString("proxy_pass", "")
+                ed.putString("proxy_secret", "")
+                ed.putBoolean("proxy_enabled", True)
+                ed.putBoolean("proxy_enabled_calls", True)
+                ed.putBoolean("proxy_calls_enabled", True)
+                ed.commit()
+            except:
+                pass
+
+            # Force calls through relay (disable P2P) so they go through proxy
+            try:
+                for ac in range(UserConfig.MAX_ACCOUNT_COUNT):
+                    try:
+                        prefs = MessagesController.getInstance(ac).getSharedPreferences("mainconfig", 0)
+                        if prefs:
+                            p2p_prev_key = "bobrsocks_p2p_backup_" + str(ac)
+                            current_p2p = prefs.getInt("calls_p2p", -1)
+                            if current_p2p != 2:
+                                # Save original P2P setting, set to 2 (nobody = relay only)
+                                prefs.edit().putInt(p2p_prev_key, current_p2p).putInt("calls_p2p", 2).commit()
+                                _log(f"vless_apply_tg_proxy: disabled P2P for ac={ac} (was {current_p2p})")
+                    except:
+                        pass
+            except:
+                pass
+        else:
+            try:
+                curr = SharedConfig.currentProxy
+                if curr and str(curr.address) == "127.0.0.1":
+                    SharedConfig.currentProxy = None
+            except:
+                pass
+
+            try:
+                SharedConfig.proxyEnabled = False
+            except:
+                pass
+
+            try:
+                ed = MessagesController.getGlobalMainSettings().edit()
+                ed.putBoolean("proxy_enabled", False)
+                ed.commit()
+            except:
+                pass
+
+            # Restore original P2P settings
+            try:
+                for ac in range(UserConfig.MAX_ACCOUNT_COUNT):
+                    try:
+                        prefs = MessagesController.getInstance(ac).getSharedPreferences("mainconfig", 0)
+                        if prefs:
+                            p2p_prev_key = "bobrsocks_p2p_backup_" + str(ac)
+                            saved_p2p = prefs.getInt(p2p_prev_key, -1)
+                            if saved_p2p >= 0:
+                                prefs.edit().putInt("calls_p2p", saved_p2p).remove(p2p_prev_key).commit()
+                                _log(f"vless_apply_tg_proxy: restored P2P for ac={ac} to {saved_p2p}")
+                    except:
+                        pass
+            except:
+                pass
+
+        try:
+            SharedConfig.saveConfig()
+        except:
+            pass
+        try:
+            SharedConfig.saveProxyList()
+        except:
+            pass
+
+        for ac in range(UserConfig.MAX_ACCOUNT_COUNT):
+            try:
+                cm = ConnectionsManager.getInstance(ac)
+                if cm:
+                    if enable:
+                        cm.setProxySettings(True, "127.0.0.1", port, "", "", "")
+                        try:
+                            prefs = MessagesController.getInstance(ac).getSharedPreferences("mainconfig", 0)
+                            if prefs:
+                                prefs.edit().putBoolean("proxy_enabled", True).putBoolean("proxy_enabled_calls", True).putBoolean("proxy_calls_enabled", True).commit()
+                        except:
+                            pass
+                        try:
+                            ok, reason = _check_proxy_tunnel(port, timeout=6.0)
+                            if ok:
+                                _log(f"vless_apply_tg_proxy: profile ac={ac} tunnel probe OK")
+                            else:
+                                _log(f"vless_apply_tg_proxy: profile ac={ac} tunnel probe FAIL: {reason}")
+                        except Exception as e:
+                            _log(f"vless_apply_tg_proxy: profile ac={ac} tunnel probe error: {e}")
+                    else:
+                        cm.setProxySettings(False, "", 0, "", "", "")
+                        try:
+                            prefs = MessagesController.getInstance(ac).getSharedPreferences("mainconfig", 0)
+                            if prefs:
+                                prefs.edit().putBoolean("proxy_enabled", False).putBoolean("proxy_enabled_calls", False).putBoolean("proxy_calls_enabled", False).commit()
+                        except:
+                            pass
+                    _log(f"vless_apply_tg_proxy: setProxySettings ac={ac} ok")
+            except Exception as e:
+                _log(f"vless_apply_tg_proxy: setProxySettings ac={ac} error: {e}")
+
+        try:
+            if enable:
+                ConnectionsManager.setProxySettings(True, "127.0.0.1", port, "", "", "")
+            else:
+                ConnectionsManager.setProxySettings(False, "", 0, "", "", "")
+            _log("vless_apply_tg_proxy: static setProxySettings ok")
+        except Exception as e:
+            _log(f"vless_apply_tg_proxy: static setProxySettings error: {e}")
+
+        def _notify():
+            try:
+                NotificationCenter.getGlobalInstance().postNotificationName(
+                    NotificationCenter.proxySettingsChanged)
+            except:
+                pass
+        run_on_ui_thread(_notify, 300)
+
+        _log(f"vless_apply_tg_proxy: done enable={enable} port={port} proxy_obj={proxy_obj is not None if enable else 'n/a'}")
+    except Exception as e:
+        _log(f"vless_apply_tg_proxy error: {e}")
+        _log_exc("vless_apply_tg_proxy traceback")
+
+def _check_vless_port(port, timeout=0.2):
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout); return s.connect_ex(('127.0.0.1', port)) == 0
+    except: return False
+
+def _recv_exact(sock, n):
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            return None
+        data += chunk
+    return data
+
+def _check_proxy_tunnel(port, timeout=6.0):
+    last_error = "no check urls"
+    for url in PROXY_CHECK_URLS:
+        ok, reason = _check_proxy_url(port, url, timeout=timeout)
+        if ok:
+            return True, reason
+        last_error = reason
+    return False, last_error
+
+def _socks5_connect(port, host, remote_port, timeout=6.0):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.settimeout(timeout)
+        s.connect(("127.0.0.1", int(port)))
+
+        s.sendall(b"\x05\x01\x00")
+        hr = _recv_exact(s, 2)
+        if not hr or len(hr) != 2 or hr[0] != 0x05 or hr[1] == 0xFF:
+            raise Exception(f"socks handshake bad: {hr.hex() if hr else 'empty'}")
+
+        host_b = str(host).encode("idna")
+        if len(host_b) > 255:
+            raise Exception("target host too long")
+        req = b"\x05\x01\x00\x03" + bytes([len(host_b)]) + host_b + int(remote_port).to_bytes(2, "big")
+        s.sendall(req)
+        head = _recv_exact(s, 4)
+        if not head or len(head) != 4:
+            raise Exception("socks connect head empty")
+        if head[0] != 0x05:
+            raise Exception(f"socks version bad: {head[0]}")
+        if head[1] != 0x00:
+            raise Exception(f"socks connect failed: rep={head[1]}")
+
+        atyp = head[3]
+        if atyp == 0x01:
+            if not _recv_exact(s, 4):
+                raise Exception("socks addr ipv4 truncated")
+        elif atyp == 0x03:
+            ln = _recv_exact(s, 1)
+            if not ln:
+                raise Exception("socks addr domain len missing")
+            if not _recv_exact(s, ln[0]):
+                raise Exception("socks addr domain truncated")
+        elif atyp == 0x04:
+            if not _recv_exact(s, 16):
+                raise Exception("socks addr ipv6 truncated")
+        else:
+            raise Exception(f"socks atyp bad: {atyp}")
+
+        if not _recv_exact(s, 2):
+            raise Exception("socks bind port missing")
+        return s
+    except:
+        try: s.close()
+        except: pass
+        raise
+
+def _check_proxy_url(port, url, timeout=6.0):
+    try:
+        u = urllib.parse.urlparse(str(url or ""))
+        scheme = (u.scheme or "https").lower()
+        host = u.hostname
+        if not host:
+            return False, "bad probe url"
+        remote_port = int(u.port or (443 if scheme == "https" else 80))
+        path = u.path or "/"
+        if u.query:
+            path += "?" + u.query
+
+        s = _socks5_connect(port, host, remote_port, timeout=timeout)
+        conn = None
+        try:
+            if scheme == "https":
+                ctx = ssl.create_default_context()
+                conn = ctx.wrap_socket(s, server_hostname=host)
+            else:
+                conn = s
+            conn.settimeout(timeout)
+            req = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {host}\r\n"
+                "User-Agent: bobrsocks-connectivity-check/1.0\r\n"
+                "Accept: text/plain,*/*\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode("utf-8")
+            conn.sendall(req)
+            data = b""
+            deadline = time.monotonic() + float(timeout)
+            while len(data) < 4096 and time.monotonic() < deadline:
+                chunk = conn.recv(1024)
+                if not chunk:
+                    break
+                data += chunk
+                if b"\r\n\r\n" in data:
+                    break
+            if not data:
+                return False, f"curl {host}: empty response"
+            first = data.split(b"\r\n", 1)[0].decode("iso-8859-1", errors="ignore")
+            m = re.match(r"HTTP/\S+\s+(\d+)", first)
+            code = int(m.group(1)) if m else 0
+            if 200 <= code < 400:
+                return True, f"curl {host}: HTTP {code}"
+            return False, f"curl {host}: HTTP {code or 'bad'}"
+        finally:
+            try: (conn or s).close()
+            except: pass
+    except Exception as e:
+        return False, f"curl {url}: {e}"
+
+def _get_free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('', 0)); return s.getsockname()[1]
+
+def _fetch_vless_nodes(url):
+    try:
+        url2 = str(url or "")
+        r = requests.get(url2, timeout=15)
+        if r.status_code != 200: return []
+        text = r.text.strip()
+        has_scheme = any(s in text for s in _PROXY_SCHEMES)
+        if not has_scheme:
+            try:
+                b64 = str(text or "").strip()
+                b64 = b64.replace("\n", "").replace("\r", "")
+                b64 = b64.replace("-", "+").replace("_", "/")
+                missing = len(b64) % 4
+                if missing:
+                    b64 += '=' * (4 - missing)
+                raw = base64.b64decode(b64, validate=False)
+                text = raw.decode('utf-8', errors='ignore')
+            except: pass
+        nodes = []
+        try:
+            links = re.findall(r"(?:vless|vmess|trojan|ss)://[^\s]+", str(text or ""))
+        except:
+            links = []
+
+        if not links:
+            try:
+                raw = str(text or "").lstrip()
+                if raw.startswith("{") or raw.startswith("["):
+                    def _walk(obj, out):
+                        if isinstance(obj, dict):
+                            t = obj.get("type")
+                            p = obj.get("protocol")
+                            if str(t).lower() == "vless" or str(p).lower() == "vless":
+                                out.append(obj)
+                            for v in obj.values():
+                                _walk(v, out)
+                        elif isinstance(obj, list):
+                            for v in obj:
+                                _walk(v, out)
+
+                    try:
+                        parsed = json.loads(raw)
+                    except Exception as je:
+                        parsed = None
+
+                    if parsed is None:
+                        raise Exception("json parse failed")
+
+                    found = []
+                    _walk(parsed, found)
+
+                    built = []
+                    for ob in found:
+                        try:
+                            uuid_str = ob.get("uuid") or ob.get("id") or ob.get("user")
+                            server = ob.get("server") or ob.get("address")
+                            port = ob.get("server_port") or ob.get("port")
+
+                            if not uuid_str:
+                                users = ob.get("users")
+                                if isinstance(users, list) and users:
+                                    u0 = users[0] if isinstance(users[0], dict) else None
+                                    if u0:
+                                        uuid_str = u0.get("uuid") or u0.get("id") or u0.get("user")
+
+                            if (not uuid_str or not server or not port) and isinstance(ob.get("settings"), dict):
+                                st = ob.get("settings") or {}
+                                vnext = st.get("vnext")
+                                if isinstance(vnext, list):
+                                    for vn in vnext:
+                                        try:
+                                            if not isinstance(vn, dict):
+                                                continue
+                                            server2 = vn.get("address") or vn.get("server") or vn.get("address")
+                                            port2 = vn.get("port")
+                                            users2 = vn.get("users")
+                                            uuid2 = None
+                                            if isinstance(users2, list) and users2:
+                                                u = users2[0] if isinstance(users2[0], dict) else None
+                                                if u:
+                                                    uuid2 = u.get("id") or u.get("uuid")
+                                            if not uuid2 or not server2 or not port2:
+                                                continue
+                                            link2 = f"vless://{uuid2}@{server2}:{int(port2)}"
+                                            tag2 = ob.get("tag") or ob.get("name") or ""
+                                            if tag2:
+                                                link2 += "#" + urllib.parse.quote(str(tag2))
+                                            built.append(link2)
+                                        except:
+                                            continue
+                                continue
+
+                            if not uuid_str or not server or not port:
+                                continue
+
+                            tls = ob.get("tls") or {}
+                            security = ""
+                            sni = ""
+                            if isinstance(tls, dict):
+                                enabled = tls.get("enabled")
+                                if enabled is True or str(enabled).lower() == "true":
+                                    security = "tls"
+                                sni = tls.get("server_name") or tls.get("sni") or ""
+
+                            transport = ob.get("transport") or {}
+                            net = "tcp"
+                            path = ""
+                            host = ""
+                            if isinstance(transport, dict):
+                                net = transport.get("type") or transport.get("network") or net
+                                net = str(net or "tcp")
+                                path = transport.get("path") or ""
+                                headers2 = transport.get("headers") or {}
+                                if isinstance(headers2, dict):
+                                    host = headers2.get("Host") or headers2.get("host") or ""
+
+                            params = {}
+                            if security:
+                                params["security"] = security
+                            if sni:
+                                params["sni"] = str(sni)
+                            if net:
+                                params["type"] = str(net)
+                            if path:
+                                params["path"] = str(path)
+                            if host:
+                                params["host"] = str(host)
+
+                            qs = "&".join([f"{urllib.parse.quote(str(k))}={urllib.parse.quote(str(v))}" for k, v in params.items()])
+                            tag = ob.get("tag") or ob.get("name") or ""
+                            frag = urllib.parse.quote(str(tag)) if tag else ""
+                            link = f"vless://{uuid_str}@{server}:{int(port)}"
+                            if qs:
+                                link += "?" + qs
+                            if frag:
+                                link += "#" + frag
+                            built.append(link)
+                        except:
+                            continue
+
+                    if built:
+                        links.extend(built)
+            except:
+                pass
+
+        if not links:
+            for line in str(text or "").splitlines():
+                line = str(line or "").strip()
+                if _is_proxy_uri(line):
+                    links.append(line)
+
+        filtered = 0
+        any_not_supported = False
+        for link in links:
+            try:
+                link = _sanitize_vless_uri(link)
+                if not _is_proxy_uri(link):
+                    continue
+                try:
+                    low = link.lower()
+                    if "@0.0.0.0:1" in low:
+                        filtered += 1
+                        any_not_supported = True
+                        continue
+                    if "приложение" in urllib.parse.unquote(link).lower() and "не поддерж" in urllib.parse.unquote(link).lower():
+                        filtered += 1
+                        any_not_supported = True
+                        continue
+                except:
+                    pass
+                conf, name = VlessConfigParser.parse(link, 1080)
+                if conf:
+                    nodes.append({"name": name, "uri": link, "ping": -1})
+            except:
+                continue
+        return nodes
+    except Exception as e:
+        _log(f"fetch_vless_nodes error ({url}): {e}"); return []
+
+class bobrsocksPlugin(BasePlugin):
+    def on_plugin_load(self):
+        try:
+            _log("on_plugin_load: start")
+            self._vless_core = VlessCore()
+            self._vless_port = 20808
+            self._vless_running = False
+            self._vless_running_uri = ""
+            self._vless_start_lock = threading.Lock()
+            self._vless_token_lock = threading.Lock()
+            self._vless_connect_token = 0
+            self._ping_event = threading.Event()
+
+            self._chat_menu_item_id = "bobrsocks_settings_chat"
+            self._drawer_menu_item_id = "bobrsocks_settings_drawer"
+            self._profile_menu_item_id = "bobrsocks_settings_profile"
+
+            self._vpn_guard_stop = threading.Event()
+            self._vpn_guard_was_active = False
+
+            self._vless_data = self.get_setting("vless_data", {"manual": [], "subs": [], "active_uri": ""})
+            self._vless_active_uri = self._vless_data.get("active_uri", "")
+            self._vless_custom_sub_url = self.get_setting("vless_custom_sub_url", "")
+            self._ping_stop = threading.Event()
+            self._vless_custom_key_buf = ""
+            self._last_custom_key_applied = ""
+            try:
+                self.set_setting("vless_custom_key", "", reload_settings=False)
+            except:
+                pass
+            self._last_custom_sub_applied = ""
+            self._last_clipboard_uri = ""
+            self._plugin_settings_card_ready = False
+            self._health_stop = threading.Event()
+            self._health_fail_count = 0
+            self._profile_recheck_stop = threading.Event()
+            self._subs_collapsed = self.get_setting("subs_collapsed", {})
+            self._xray_download_lock = threading.Lock()
+
+            self._add_menu_items()
+            self._install_clipboard_hook()
+            self._install_settings_hooks()
+
+            self._vpn_guard_stop.clear()
+            threading.Thread(target=self._vpn_guard_loop, daemon=True).start()
+
+            _log(f"on_plugin_load: vless_enabled={self.get_setting('vless_enabled', True)} active_uri={bool(self._vless_active_uri)}")
+            threading.Thread(target=self._vless_pinger_loop, daemon=True).start()
+            threading.Thread(target=self._health_check_loop, daemon=True).start()
+            threading.Thread(target=self._profile_recheck_loop, daemon=True).start()
+            if not self._vless_core.is_available():
+                threading.Thread(target=self._download_xray_and_reload_bg, args=(None,), daemon=True).start()
+            if self.get_setting("vless_enabled", True) and self._vless_active_uri:
+                threading.Thread(target=self._vless_connect, daemon=True).start()
+            _log("on_plugin_load: done")
+        except Exception:
+            _log_exc("on_plugin_load crash")
+
+    def on_plugin_unload(self):
+        try:
+            _log("on_plugin_unload: start")
+            try: self._ping_stop.set()
+            except: pass
+            try: self._health_stop.set()
+            except: pass
+            try: self._profile_recheck_stop.set()
+            except: pass
+            try: self._vpn_guard_stop.set()
+            except: pass
+            try: self._vless_disconnect(silent=True)
+            except: _log_exc("on_plugin_unload disconnect")
+            try: self._remove_menu_items()
+            except: _log_exc("on_plugin_unload remove menu")
+            _log("on_plugin_unload: done")
+        except Exception:
+            _log_exc("on_plugin_unload crash")
+
+    def _download_xray(self, force=False):
+        return self._download_xray_with_progress(None, force=force)
+
+    def _xray_modules_dir(self):
+        ctx = ApplicationLoader.applicationContext
+        try:
+            base_dir = str(ctx.getCodeCacheDir())
+        except:
+            base_dir = str(ctx.getFilesDir())
+        dir_path = os.path.join(base_dir, "exitfy_modules")
+        if not os.path.exists(dir_path):
+            os.makedirs(dir_path)
+        try: os.chmod(dir_path, 0o700)
+        except: pass
+        return dir_path
+
+    def _libxray_path(self):
+        try:
+            return os.path.join(self._xray_modules_dir(), "libxray.so")
+        except:
+            return None
+
+    def _old_libxray_path(self):
+        try:
+            ctx = ApplicationLoader.applicationContext
+            return os.path.join(str(ctx.getFilesDir()), "exitfy_modules", "libxray.so")
+        except:
+            return None
+
+    def _migrate_old_libxray(self):
+        try:
+            new_path = self._libxray_path()
+            old_path = self._old_libxray_path()
+            if not new_path or not old_path or new_path == old_path:
+                return False
+            if os.path.exists(new_path) and os.path.getsize(new_path) >= LIBXRAY_MIN_SIZE:
+                return True
+            if not os.path.exists(old_path) or os.path.getsize(old_path) < LIBXRAY_MIN_SIZE:
+                return False
+            dir_path = os.path.dirname(new_path)
+            if not os.path.exists(dir_path):
+                os.makedirs(dir_path)
+            with open(old_path, "rb") as src, open(new_path + ".migrate", "wb") as dst:
+                while True:
+                    chunk = src.read(65536)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+            try: os.chmod(new_path + ".migrate", 0o600)
+            except: pass
+            os.rename(new_path + ".migrate", new_path)
+            try: os.remove(old_path)
+            except: pass
+            _log(f"libxray migrated: {new_path}")
+            return True
+        except Exception as e:
+            _log(f"libxray migrate error: {e}")
+            return False
+
+    def _get_libxray_release_asset(self):
+        r = requests.get(LIBXRAY_RELEASE_API_URL, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        assets = data.get("assets", [])
+        sha_url = ""
+        sha256 = ""
+        for a in data.get("assets", []):
+            if str(a.get("name", "")) == "libxray.so.sha256":
+                sha_url = str(a.get("browser_download_url", ""))
+                break
+        if sha_url:
+            try:
+                sr = requests.get(sha_url, timeout=20)
+                sr.raise_for_status()
+                m = re.search(r"\b([a-fA-F0-9]{64})\b", str(sr.text or ""))
+                if m:
+                    sha256 = m.group(1).lower()
+            except Exception as e:
+                _log(f"libxray sha256 fetch error: {e}")
+        for a in assets:
+            if str(a.get("name", "")) == "libxray.so":
+                return {
+                    "tag": str(data.get("tag_name", "")),
+                    "name": "libxray.so",
+                    "url": str(a.get("browser_download_url", "")),
+                    "sha256": sha256,
+                }
+        return {"tag": "libxray-latest", "name": "libxray.so", "url": LIBXRAY_FALLBACK_URL, "sha256": sha256}
+
+    def _download_xray_with_progress(self, on_progress, force=False):
+        tmp_path = None
+        try:
+            lib_path = self._libxray_path()
+            if not lib_path:
+                return False
+            if (not force) and self._has_xray_addon():
+                if callable(on_progress):
+                    try: on_progress(1.0, 0, 0, "already installed")
+                    except: pass
+                return True
+            dir_path = os.path.dirname(lib_path)
+            if not os.path.exists(dir_path):
+                os.makedirs(dir_path)
+            self._migrate_old_libxray()
+
+            if callable(on_progress):
+                try: on_progress(0.0, 0, 0, "fetch release metadata")
+                except: pass
+            asset = self._get_libxray_release_asset()
+            url = asset.get("url", "")
+            tmp_path = lib_path + ".download"
+
+            _log(f"libxray download: start {asset.get('tag')} {asset.get('name')}")
+            if callable(on_progress):
+                try: on_progress(0.0, 0, 0, f"asset {asset.get('tag')} {asset.get('name')}")
+                except: pass
+            r = requests.get(url, stream=True, timeout=60)
+            r.raise_for_status()
+
+            total = 0
+            try:
+                total = int(r.headers.get("content-length") or 0)
+            except:
+                total = 0
+
+            done = 0
+            if callable(on_progress):
+                try: on_progress(0.0, 0, total, "download start")
+                except: pass
+
+            h = hashlib.sha256()
+            with open(tmp_path, "wb") as f:
+                for chunk in r.iter_content(8192):
+                    if not chunk:
+                        continue
+                    f.write(chunk)
+                    h.update(chunk)
+                    done += len(chunk)
+                    if callable(on_progress):
+                        try:
+                            if total > 0:
+                                on_progress(float(done) / float(total), done, total, "download")
+                            else:
+                                # fallback if size unknown
+                                on_progress(0.0, done, total, "download")
+                        except:
+                            pass
+
+            if callable(on_progress):
+                try: on_progress(1.0, done, total, "download complete")
+                except: pass
+
+            got_sha = h.hexdigest().lower()
+            want_sha = str(asset.get("sha256", "") or "").lower()
+            _log(f"libxray download: done bytes={done} total={total} sha256={got_sha}")
+            if callable(on_progress):
+                try: on_progress(1.0, done, total, "verify sha256")
+                except: pass
+            try:
+                if os.path.getsize(tmp_path) < LIBXRAY_MIN_SIZE:
+                    _log("libxray download: file too small")
+                    try: os.remove(tmp_path)
+                    except: pass
+                    return False
+                if want_sha and got_sha != want_sha:
+                    _log(f"libxray download: sha256 mismatch want={want_sha} got={got_sha}")
+                    try: os.remove(tmp_path)
+                    except: pass
+                    return False
+
+                if callable(on_progress):
+                    try: on_progress(1.0, done, total, "sha256 ok")
+                    except: pass
+                try: os.chmod(tmp_path, 0o600)
+                except: pass
+                if callable(on_progress):
+                    try: on_progress(1.0, done, total, "install libxray.so")
+                    except: pass
+                os.rename(tmp_path, lib_path)
+                try:
+                    self.set_setting("libxray_core_tag", asset.get("tag", ""), reload_settings=False)
+                    self.set_setting("libxray_core_asset", asset.get("name", ""), reload_settings=False)
+                    self.set_setting("libxray_core_sha256", got_sha, reload_settings=False)
+                    self.set_setting("libxray_core_url", url, reload_settings=False)
+                except:
+                    pass
+            except:
+                return False
+            if callable(on_progress):
+                try: on_progress(1.0, done, total, "done")
+                except: pass
+            return True
+        except Exception as e:
+            _log(f"libxray download error: {e}")
+            try:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except:
+                pass
+            return False
+
+    def _download_xray_and_reload(self, force=True):
+        try:
+            frag = get_last_fragment()
+            act = frag.getParentActivity() if frag else None
+        except:
+            act = None
+
+        if not act:
+            threading.Thread(target=lambda: self._download_xray_and_reload_bg(None, force=force), daemon=True).start()
+            return
+
+        dialog_box = {"builder": None, "logs": []}
+
+        def format_logs():
+            try:
+                lines = dialog_box.get("logs", [])[-18:]
+                return "\n".join(lines)
+            except:
+                return Z("addon_downloading")
+
+        def append_log(line):
+            try:
+                s = str(line or "")
+                if not s:
+                    return
+                logs = dialog_box.get("logs", [])
+                if logs and logs[-1] == s:
+                    return
+                logs.append(s)
+                if len(logs) > 80:
+                    del logs[0:len(logs) - 80]
+            except:
+                pass
+
+        def show_dialog():
+            try:
+                append_log(Z("addon_downloading"))
+                append_log(Z("addon_download_source").format(url=LIBXRAY_RELEASE_API_URL))
+                builder = AlertDialogBuilder(act)
+                try:
+                    builder.set_title(Z("addon_download_title"))
+                except:
+                    pass
+                try:
+                    builder.set_message(format_logs())
+                    builder.set_negative_button(Z("btn_cancel"), lambda bb, w: bb.dismiss())
+                except:
+                    pass
+                builder.show()
+
+                dialog_box["builder"] = builder
+            except Exception as e:
+                _log(f"download dialog show error: {e}")
+
+        def update_log_dialog(line=None):
+            try:
+                if line:
+                    append_log(line)
+                b = dialog_box.get("builder")
+                if not b:
+                    return
+                try: b.set_message(format_logs())
+                except: pass
+            except:
+                pass
+
+        def set_progress(p, done=0, total=0, stage=""):
+            try:
+                try:
+                    pct = int(max(0.0, min(1.0, float(p))) * 100.0)
+                except:
+                    pct = 0
+                try:
+                    done_mb = float(done or 0) / 1048576.0
+                    total_mb = float(total or 0) / 1048576.0
+                    if total and total > 0:
+                        size = f"{done_mb:.1f}/{total_mb:.1f} MB"
+                    else:
+                        size = f"{done_mb:.1f} MB"
+                except:
+                    size = ""
+                label = str(stage or "progress")
+                msg = f"{label}: {pct}%"
+                if size:
+                    msg += " - " + size
+                if stage and stage not in ("download",):
+                    update_log_dialog(label)
+                elif pct == 0 or pct == 100 or pct % 10 == 0:
+                    update_log_dialog(msg)
+            except:
+                pass
+
+        run_on_ui_thread(show_dialog)
+
+        def task():
+            try:
+                lock = getattr(self, "_xray_download_lock", None)
+                if lock:
+                    acquired = lock.acquire(False)
+                    if not acquired:
+                        run_on_ui_thread(lambda: update_log_dialog("download already running"))
+                        return
+                else:
+                    acquired = False
+                if force:
+                    try: self._vless_disconnect(silent=True)
+                    except: pass
+                try:
+                    def on_progress(p, done=0, total=0, stage=""):
+                        run_on_ui_thread(lambda: set_progress(p, done, total, stage))
+
+                    ok = self._download_xray_with_progress(on_progress, force=force)
+                    if ok:
+                        _log("xray download: init core")
+                        self._vless_core = VlessCore()
+                finally:
+                    if lock and acquired:
+                        lock.release()
+                try:
+                    _log(f"xray core available={self._vless_core.is_available()} mode={getattr(self._vless_core, 'mode', None)}")
+                except:
+                    pass
+                run_on_ui_thread(self._reload_settings_ui)
+                if not ok:
+                    try:
+                        run_on_ui_thread(lambda: update_log_dialog("ERROR: " + Z("addon_download_error")))
+                        run_on_ui_thread(lambda: BulletinHelper.show_error(Z("addon_download_error")))
+                    except:
+                        pass
+                elif force:
+                    try:
+                        run_on_ui_thread(lambda: update_log_dialog("OK: " + Z("addon_download_done")))
+                        run_on_ui_thread(lambda: BulletinHelper.show_success(Z("addon_download_done")))
+                    except:
+                        pass
+            except Exception as e:
+                _log(f"download xray task error: {e}")
+                run_on_ui_thread(self._reload_settings_ui)
+                try:
+                    run_on_ui_thread(lambda: update_log_dialog("ERROR: " + str(e)))
+                    run_on_ui_thread(lambda: BulletinHelper.show_error(Z("addon_download_error")))
+                except:
+                    pass
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _download_xray_and_reload_bg(self, on_progress, force=False):
+        try:
+            lock = getattr(self, "_xray_download_lock", None)
+            if lock:
+                acquired = lock.acquire(False)
+                if not acquired:
+                    return
+            else:
+                acquired = False
+            try:
+                ok = self._download_xray_with_progress(on_progress, force=force)
+                if ok:
+                    self._vless_core = VlessCore()
+                    try:
+                        if self.get_setting("vless_enabled", True) and self._vless_active_uri:
+                            threading.Thread(target=self._vless_connect, daemon=True).start()
+                    except:
+                        pass
+            finally:
+                if lock and acquired:
+                    lock.release()
+            run_on_ui_thread(self._reload_settings_ui)
+        except Exception as e:
+            _log(f"download xray bg error: {e}")
+            run_on_ui_thread(self._reload_settings_ui)
+
+    def _has_xray_addon(self):
+        try:
+            p = self._libxray_path()
+            return bool(p) and os.path.exists(p) and os.path.getsize(p) >= LIBXRAY_MIN_SIZE
+        except:
+            return False
+
+    def _delete_xray_and_reload(self):
+        try:
+            self._vless_disconnect(silent=True)
+        except:
+            pass
+
+        def task():
+            ok = False
+            try:
+                paths = [self._libxray_path()]
+                old = os.path.join(self._xray_modules_dir(), "libvless.so")
+                old_bin = os.path.join(self._xray_modules_dir(), "xray")
+                paths.append(old)
+                paths.append(old_bin)
+                for p in paths:
+                    if p and os.path.exists(p):
+                        try:
+                            os.remove(p)
+                            ok = True
+                        except Exception as e:
+                            _log(f"xray delete error: {e}")
+                self._vless_core = VlessCore()
+            except Exception as e:
+                _log(f"xray delete task error: {e}")
+            run_on_ui_thread(self._reload_settings_ui)
+            if not ok:
+                try:
+                    run_on_ui_thread(lambda: BulletinHelper.show_error(Z("addon_delete_error")))
+                except:
+                    pass
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _is_system_vpn_active(self):
+        try:
+            ctx = ApplicationLoader.applicationContext
+            cm = ctx.getSystemService("connectivity")
+            if not cm:
+                return False
+
+            try:
+                active = cm.getActiveNetwork()
+                caps = cm.getNetworkCapabilities(active) if active else None
+                if caps:
+                    try:
+                        from android.net import NetworkCapabilities
+                        return bool(caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN))
+                    except:
+                        pass
+            except:
+                pass
+
+            try:
+                info = cm.getActiveNetworkInfo()
+                if info and info.isConnected():
+                    try:
+                        from android.net import ConnectivityManager
+                        return int(info.getType()) == int(ConnectivityManager.TYPE_VPN)
+                    except:
+                        pass
+            except:
+                pass
+        except:
+            return False
+        return False
+
+    def _disable_plugin_due_to_vpn(self):
+        try:
+            self._vless_disconnect(silent=True)
+            try:
+                self.set_setting("vless_enabled", False, reload_settings=True)
+            except:
+                pass
+            _set_tg_proxy_enabled(False)
+            try:
+                _vless_apply_tg_proxy(0, False)
+            except:
+                pass
+            run_on_ui_thread(self._reload_settings_ui)
+            _log("system VPN detected -> plugin disabled")
+        except Exception as e:
+            _log(f"vpn auto-disable error: {e}")
+
+    def _vpn_guard_loop(self):
+        while not self._vpn_guard_stop.is_set():
+            try:
+                vpn_active = bool(self._is_system_vpn_active())
+                enabled = bool(self.get_setting("vless_enabled", True))
+                if vpn_active and enabled:
+                    if not self._vpn_guard_was_active:
+                        self._vpn_guard_was_active = True
+                        self._disable_plugin_due_to_vpn()
+                elif not vpn_active:
+                    self._vpn_guard_was_active = False
+            except:
+                pass
+            self._vpn_guard_stop.wait(3.0)
+
+    def create_settings(self):
+        items = []
+
+        try:
+            if not getattr(self, "_plugin_settings_card_ready", False):
+                items += self._vless_quick_action_items()
+        except Exception as e:
+            _log(f"quick actions error: {e}")
+
+        items += [
+            Header(text=Z("settings_header")),
+        ]
+
+        try:
+            items += self._vless_settings_items()
+        except Exception as e:
+            _log(f"settings error: {e}")
+            items += [Text(text=Z("settings_error"), icon="msg_info"), Divider()]
+
+        try:
+            del_btn = Z("addon_delete")
+
+            def on_delete(v):
+                try:
+                    frag = get_last_fragment()
+                    act = frag.getParentActivity() if frag else None
+                    if not act:
+                        self._delete_xray_and_reload()
+                        return
+
+                    title = Z("addon_delete_title")
+                    msg = Z("addon_delete_msg")
+                    yes = Z("btn_delete")
+                    no = Z("btn_cancel")
+
+                    b = AlertDialogBuilder(act)
+                    b.set_title(title)
+                    b.set_message(msg)
+                    b.set_negative_button(no, lambda bb, w: bb.dismiss())
+                    b.set_positive_button(yes, lambda bb, w: (bb.dismiss(), self._delete_xray_and_reload()))
+                    try:
+                        b.make_button_red(AlertDialogBuilder.BUTTON_POSITIVE)
+                    except:
+                        pass
+                    b.show()
+                except Exception as e:
+                    _log(f"delete addon dialog error: {e}")
+                    self._delete_xray_and_reload()
+
+            if self._has_xray_addon():
+                items.append(Divider())
+                items.append(Text(text=Z("vless_update_addon"), icon="msg_download", accent=True,
+                                  on_click=lambda v: self._download_xray_and_reload(force=True)))
+                items.append(Text(text=del_btn, icon="msg_delete", red=True, on_click=on_delete))
+
+        except:
+            pass
+
+        items += [
+            Divider(text=Z("proxy_hint") + " — " + Z("proxy_hint_full").replace("\n", " ")),
+        ]
+
+        items += [
+            Divider(),
+            Header(text=Z("debug_logs_header")),
+            Text(text=Z("debug_tunnel_probe"), icon="msg_info", on_click=lambda v: self._run_tunnel_probe_ui()),
+            Text(text=Z("debug_show_logs"), icon="msg_info", on_click=lambda v: self._show_debug_logs_dialog()),
+            Text(text=Z("debug_copy_logs"), icon="msg_info", on_click=lambda v: self._copy_debug_logs_to_clipboard()),
+            Text(text=Z("debug_clear_logs"), icon="msg_delete", red=True, on_click=lambda v: self._clear_debug_logs_ui()),
+        ]
+
+        return items
+
+    def _build_debug_report(self):
+        try:
+            status = [
+                f"enabled={bool(self.get_setting('vless_enabled', True))}",
+                f"running={bool(getattr(self, '_vless_running', False))}",
+                f"core={bool(self._vless_core.is_available())}",
+                f"port={int(getattr(self, '_vless_port', 0) or 0)}",
+                f"active_uri={bool(getattr(self, '_vless_active_uri', ''))}",
+                f"auto_switch={bool(self.get_setting('auto_switch_enabled', False))}",
+            ]
+        except:
+            status = ["status_unavailable=true"]
+
+        logs = _get_debug_logs(160)
+        if not logs:
+            logs = [Z("debug_logs_empty")]
+        text = "Status: " + ", ".join(status) + "\n\n" + "\n".join(logs)
+        if len(text) > 12000:
+            text = text[-12000:]
+        return text
+
+    def _copy_to_clipboard_text(self, text):
+        try:
+            ctx = ApplicationLoader.applicationContext
+            cm = ctx.getSystemService("clipboard") if ctx else None
+            if not cm:
+                return False
+            from android.content import ClipData
+            cm.setPrimaryClip(ClipData.newPlainText("bobrsocks-logs", str(text or "")))
+            return True
+        except:
+            return False
+
+    def _copy_debug_logs_to_clipboard(self):
+        try:
+            report = self._build_debug_report()
+            if self._copy_to_clipboard_text(report):
+                run_on_ui_thread(lambda: BulletinHelper.show_success(Z("debug_logs_copied")))
+        except:
+            pass
+
+    def _clear_debug_logs_ui(self):
+        try:
+            _clear_debug_logs()
+            _log("debug logs cleared")
+            run_on_ui_thread(lambda: BulletinHelper.show_success("OK"))
+        except:
+            pass
+
+    def _show_debug_logs_dialog(self):
+        try:
+            report = self._build_debug_report()
+            frag = get_last_fragment()
+            act = frag.getParentActivity() if frag else None
+            if not act:
+                self._copy_to_clipboard_text(report)
+                run_on_ui_thread(lambda: BulletinHelper.show_success(Z("debug_logs_copied")))
+                return
+
+            b = AlertDialogBuilder(act)
+            b.set_title(Z("debug_logs_header"))
+            b.set_message(report)
+            b.set_positive_button(Z("debug_copy_logs"), lambda d, w: (self._copy_debug_logs_to_clipboard(), d.dismiss()))
+            b.set_negative_button(Z("btn_cancel"), lambda d, w: d.dismiss())
+            b.show()
+        except Exception as e:
+            _log(f"show debug logs dialog error: {e}")
+
+    def _run_tunnel_probe_ui(self):
+        def _worker():
+            try:
+                port = int(getattr(self, "_vless_port", 0) or 0)
+                if port <= 0:
+                    run_on_ui_thread(lambda: BulletinHelper.show_error(Z("debug_tunnel_fail").format(reason="port=0")))
+                    return
+                ok, reason = _check_proxy_tunnel(port, timeout=8.0)
+                if ok:
+                    _log("manual tunnel probe: OK")
+                    run_on_ui_thread(lambda: BulletinHelper.show_success(Z("debug_tunnel_ok")))
+                else:
+                    _log(f"manual tunnel probe: FAIL: {reason}")
+                    run_on_ui_thread(lambda: BulletinHelper.show_error(Z("debug_tunnel_fail").format(reason=str(reason))))
+            except Exception as e:
+                _log(f"manual tunnel probe error: {e}")
+                run_on_ui_thread(lambda: BulletinHelper.show_error(Z("debug_tunnel_fail").format(reason=str(e))))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _vless_settings_items(self):
+        if not self._vless_core.is_available():
+            msg = Z("vless_no_core_msg")
+            btn = Z("vless_download_addon")
+            items = [
+                Divider(text=msg),
+                Text(text=btn, icon="msg_download", accent=True,
+                     on_click=lambda v: self._download_xray_and_reload(force=True)),
+            ]
+            if self._has_xray_addon():
+                del_btn = Z("addon_delete")
+                items.append(Text(text=del_btn, icon="msg_delete", red=True,
+                                  on_click=lambda v: self._delete_xray_and_reload()))
+            items.append(Divider())
+            return items
+
+        active = self._vless_active_uri
+
+        items = [
+            Input(key="vless_custom_sub", text=Z("vless_add_sub"),
+                  default="",
+                  icon="msg_link",
+                  on_change=self._on_vless_custom_sub_input),
+            Divider(),
+            Switch(key="vless_enabled", text=Z("enable_plugin"),
+                   default=True,
+                   icon="msg_permissions", on_change=self._on_enabled_changed),
+            Switch(key="auto_switch_enabled", text=Z("auto_switch"),
+                   default=False,
+                   icon="msg_retry"),
+            Input(key="profile_recheck_interval_sec", text=Z("profile_recheck_interval"),
+                  default=str(int(PROFILE_RECHECK_INTERVAL_SEC_DEFAULT)),
+                  icon="msg_recent", on_change=self._on_profile_recheck_interval_input),
+            Divider(),
+            Header(text=Z("vless_nodes_header")),
+        ]
+
+        if not self._vless_data.get("manual") and not self._vless_data.get("subs"):
+            items.append(Text(text=Z("vless_no_nodes")))
+        else:
+            if self._vless_data.get("manual"):
+                for i, node in enumerate(self._vless_data["manual"]):
+                    is_act = (node["uri"] == active)
+                    ping = node.get("ping", -1)
+                    ping_str = f" — {ping}ms" if ping and ping > 0 and ping < 9999 else ""
+                    prefix = "[*] " if is_act else ""
+                    label = prefix + node["name"] + ping_str
+                    items.append(Text(text=label, accent=bool(is_act),
+                                      on_click=self._make_node_options(i, "manual", node)))
+
+            for sub in self._vless_data.get("subs", []):
+                nodes = sub.get("nodes", [])
+                if not nodes: continue
+                sub_url = sub.get("url", "")
+                is_active_sub = any(n.get("uri") == active for n in nodes)
+                collapsed = self._get_sub_collapsed(sub_url, is_active_sub)
+                arrow = "[+]" if collapsed else "[-]"
+                items.append(Text(text=f"{arrow} {sub.get('name', Z('vless_nodes_header'))} ({len(nodes)})", icon="msg_settings_14",
+                                  on_click=self._make_sub_toggle(sub_url, is_active_sub)))
+                items.append(Text(text=Z("vless_sub_manage"), icon="msg_settings_14",
+                                  on_click=self._make_sub_options(sub_url)))
+                if collapsed:
+                    continue
+                for j, node in enumerate(nodes):
+                    is_act = (node["uri"] == active)
+                    ping = node.get("ping", -1)
+                    ping_str = f" — {ping}ms" if ping and ping > 0 and ping < 9999 else ""
+                    prefix = "[*] " if is_act else ""
+                    label = prefix + node["name"] + ping_str
+                    items.append(Text(text=label, accent=bool(is_act),
+                                      on_click=self._make_vless_node_select(node["uri"])))
+
+        items += [
+            Text(text=Z("vless_nodes_manage"), icon="msg_settings_14",
+                 on_click=lambda v: self._vless_open_nodes_menu()),
+            Divider(),
+        ]
+        return items
+
+    def _vless_quick_action_items(self):
+        return [
+            Header(text=Z("vless_quick_actions")),
+            Text(text=Z("vless_add_key"),
+                 icon="msg_link2", accent=True,
+                 on_click=lambda v: self._paste_vless_from_clipboard()),
+            Text(text=Z("open_tg_settings"), icon="msg_settings",
+                 on_click=lambda v: self._open_tg_proxy_settings()),
+            Divider(text=Z("vless_paste_hint")),
+        ]
+
+    def _add_menu_items(self):
+        def on_click(ctx):
+            self._open_settings()
+
+        for mid in (self._chat_menu_item_id, self._drawer_menu_item_id, self._profile_menu_item_id):
+            try:
+                self.remove_menu_item(mid)
+            except:
+                pass
+
+        try:
+            self.add_menu_item(MenuItemData(
+                menu_type=MenuItemType.CHAT_ACTION_MENU,
+                item_id=self._chat_menu_item_id,
+                text=Z("menu_settings"),
+                on_click=on_click,
+                icon="msg_settings",
+                priority=100,
+            ))
+        except:
+            pass
+
+        try:
+            self.add_menu_item(MenuItemData(
+                menu_type=MenuItemType.DRAWER_MENU,
+                item_id=self._drawer_menu_item_id,
+                text=Z("menu_settings"),
+                subtext="VLESS/VMess/Trojan/SS",
+                on_click=on_click,
+                icon="msg_settings",
+                priority=100,
+            ))
+        except:
+            pass
+
+        try:
+            self.add_menu_item(MenuItemData(
+                menu_type=MenuItemType.PROFILE_ACTION_MENU,
+                item_id=self._profile_menu_item_id,
+                text=Z("menu_settings"),
+                on_click=on_click,
+                icon="msg_settings",
+                priority=100,
+            ))
+        except:
+            pass
+
+    def _install_clipboard_hook(self):
+        try:
+            plugin_ref = self
+            class _ClipboardHook(MethodHook):
+                def after_hooked_method(self, param):
+                    try:
+                        uris = plugin_ref._get_clipboard_proxy_uris()
+                        if not uris:
+                            return
+                        if uris[0] == getattr(plugin_ref, "_last_clipboard_uri", ""):
+                            return
+                        manual = plugin_ref._vless_data.get("manual", [])
+                        existing = {n["uri"] for n in manual}
+                        new_uris = [u for u in uris if u not in existing]
+                        if not new_uris:
+                            plugin_ref._last_clipboard_uri = uris[0]
+                            return
+                        plugin_ref._last_clipboard_uri = uris[0]
+                        plugin_ref._show_clipboard_add_dialog(new_uris)
+                    except:
+                        pass
+
+            LaunchActivity = find_class("org.telegram.ui.LaunchActivity")
+            if LaunchActivity:
+                for m in LaunchActivity.getDeclaredMethods():
+                    if m.getName() == "onResume" and len(m.getParameterTypes()) == 0:
+                        self.hook_method(m, _ClipboardHook())
+                        _log("clipboard hook installed")
+                        break
+        except Exception as e:
+            _log(f"clipboard hook install error: {e}")
+
+    def _get_clipboard_proxy_uris(self):
+        try:
+            ctx = ApplicationLoader.applicationContext
+            cm = ctx.getSystemService("clipboard")
+            if not cm or not cm.hasPrimaryClip():
+                return []
+            clip = cm.getPrimaryClip()
+            if not clip or clip.getItemCount() == 0:
+                return []
+            item = clip.getItemAt(0)
+            if not item:
+                return []
+            text = str(item.getText() or "")
+            if not any(s in text for s in _PROXY_SCHEMES):
+                return []
+            return _extract_proxy_uris(text)
+        except:
+            return []
+
+    def _get_clipboard_proxy_uri(self):
+        uris = self._get_clipboard_proxy_uris()
+        return uris[0] if uris else ""
+
+    def _paste_vless_from_clipboard(self):
+        uris = self._get_clipboard_proxy_uris()
+        if not uris:
+            run_on_ui_thread(lambda: BulletinHelper.show_error(Z("clipboard_empty")))
+            return
+        self._last_clipboard_uri = uris[0]
+        if len(uris) == 1:
+            self._vless_custom_key_buf = uris[0]
+            self._last_custom_key_applied = uris[0]
+            self._apply_vless_custom_key()
+        else:
+            self._apply_vless_custom_keys(uris)
+
+    def _view_group_has_tag(self, group, tag):
+        try:
+            return group.findViewWithTag(tag) is not None
+        except:
+            pass
+        try:
+            for i in range(group.getChildCount()):
+                child = group.getChildAt(i)
+                try:
+                    if child and str(child.getTag()) == str(tag):
+                        return True
+                except:
+                    pass
+        except:
+            pass
+        return False
+
+    def _build_native_settings_entry(self, ctx, tag, show_hint=False):
+        from android.widget import LinearLayout, TextView
+        from android.view import Gravity
+        from android.graphics import Color, Typeface
+        from android.util import TypedValue
+
+        density = ctx.getResources().getDisplayMetrics().density
+        outer = LinearLayout(ctx)
+        outer.setOrientation(LinearLayout.VERTICAL)
+        try:
+            outer.setTag(tag)
+        except:
+            pass
+
+        row = LinearLayout(ctx)
+        row.setOrientation(LinearLayout.HORIZONTAL)
+        row.setGravity(Gravity.CENTER_VERTICAL)
+        row.setPadding(int(16 * density), int(12 * density), int(16 * density), int(12 * density))
+
+        badge = TextView(ctx)
+        badge.setText("V")
+        badge.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13)
+        badge.setTypeface(Typeface.DEFAULT_BOLD)
+        badge.setPadding(int(10 * density), int(5 * density), int(10 * density), int(5 * density))
+        try:
+            badge.setTextColor(Color.WHITE)
+        except:
+            pass
+        try:
+            from android.graphics.drawable import GradientDrawable
+            bg = GradientDrawable()
+            bg.setShape(GradientDrawable.RECTANGLE)
+            bg.setColor(Color.parseColor("#3F8AE0"))
+            bg.setCornerRadius(float(10 * density))
+            badge.setBackground(bg)
+        except:
+            try:
+                badge.setBackgroundColor(Color.parseColor("#3F8AE0"))
+            except:
+                pass
+        row.addView(badge)
+
+        spacer = TextView(ctx)
+        spacer.setWidth(int(12 * density))
+        row.addView(spacer)
+
+        labels = LinearLayout(ctx)
+        labels.setOrientation(LinearLayout.VERTICAL)
+
+        title = TextView(ctx)
+        title.setText(Z("tg_settings_vless"))
+        title.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
+        title.setTypeface(Typeface.DEFAULT_BOLD)
+        labels.addView(title)
+
+        subtitle = TextView(ctx)
+        subtitle.setText(Z("tg_settings_vless_desc"))
+        subtitle.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13)
+        try:
+            subtitle.setTextColor(Color.parseColor("#8E8E93"))
+        except:
+            pass
+        labels.addView(subtitle)
+
+        try:
+            row.addView(labels, LinearLayout.LayoutParams(0, -2, 1.0))
+        except:
+            row.addView(labels)
+
+        arrow = TextView(ctx)
+        arrow.setText(">")
+        arrow.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15)
+        try:
+            arrow.setTextColor(Color.parseColor("#3F8AE0"))
+        except:
+            pass
+        row.addView(arrow)
+
+        def on_click(v):
+            try:
+                self._open_settings()
+            except:
+                pass
+
+        row.setOnClickListener(on_click)
+        row.setClickable(True)
+
+        try:
+            from android.R import attr as R_attr
+            ta = ctx.obtainStyledAttributes([R_attr.selectableItemBackground])
+            row.setBackgroundResource(ta.getResourceId(0, 0))
+            ta.recycle()
+        except:
+            pass
+
+        outer.addView(row)
+
+        if show_hint:
+            hint = TextView(ctx)
+            hint.setText(Z("proxy_hint") + " — " + Z("proxy_hint_full").replace("\n", " "))
+            hint.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13)
+            hint.setPadding(int(16 * density), int(4 * density), int(16 * density), int(12 * density))
+            try:
+                hint.setTextColor(Color.parseColor("#8E8E93"))
+            except:
+                pass
+            try:
+                hint.setSingleLine(False)
+                hint.setMaxLines(10)
+                hint.setEllipsize(None)
+            except:
+                pass
+            try:
+                hint_lp = LinearLayout.LayoutParams(-1, -2)
+                outer.addView(hint, hint_lp)
+            except:
+                outer.addView(hint)
+
+        return outer
+
+    def _inject_settings_shortcut(self, result, tag, show_hint=False):
+        try:
+            from android.view import ViewGroup
+        except:
+            return
+
+        if result is None:
+            return
+
+        try:
+            frag = get_last_fragment()
+            ctx = frag.getParentActivity() if frag else ApplicationLoader.applicationContext
+        except:
+            ctx = ApplicationLoader.applicationContext
+
+        try:
+            if isinstance(result, ViewGroup):
+                if self._view_group_has_tag(result, tag):
+                    return
+                result.addView(self._build_native_settings_entry(ctx, tag, show_hint), 0)
+                return
+
+            parent = result.getParent() if hasattr(result, "getParent") else None
+            if parent and isinstance(parent, ViewGroup):
+                if self._view_group_has_tag(parent, tag):
+                    return
+                idx = -1
+                for i in range(parent.getChildCount()):
+                    if parent.getChildAt(i) == result:
+                        idx = i
+                        break
+                entry = self._build_native_settings_entry(ctx, tag, show_hint)
+                if idx >= 0:
+                    parent.addView(entry, idx + 1)
+                else:
+                    parent.addView(entry, 0)
+        except Exception as e:
+            _log(f"inject settings shortcut error: {e}")
+
+    def _plugin_value_matches(self, value):
+        try:
+            s = str(value or "").strip().lower()
+        except:
+            return False
+        if not s:
+            return False
+        if s in (str(self.id).lower(), str(__id__).lower(), str(__name__).lower()):
+            return True
+        return str(self.id).lower() in s
+
+    def _plugin_object_matches(self, obj, depth=0):
+        if obj is None or depth > 1:
+            return False
+
+        try:
+            if self._plugin_value_matches(obj):
+                return True
+        except:
+            pass
+
+        for attr in ("id", "pluginId", "plugin_id", "name", "slug", "shortName", "__id__"):
+            try:
+                if self._plugin_value_matches(getattr(obj, attr)):
+                    return True
+            except:
+                pass
+
+        for meth in ("getId", "getPluginId", "getName", "getSlug"):
+            try:
+                fn = getattr(obj, meth)
+                if callable(fn) and self._plugin_value_matches(fn()):
+                    return True
+            except:
+                pass
+
+        try:
+            cls = obj.getClass()
+            if cls:
+                for field in cls.getDeclaredFields():
+                    try:
+                        field.setAccessible(True)
+                        val = field.get(obj)
+                        if self._plugin_value_matches(val):
+                            return True
+                    except:
+                        pass
+        except:
+            pass
+
+        return False
+
+    def _is_our_plugin_settings_fragment(self, fragment):
+        if fragment is None:
+            return False
+
+        for field_name in ("plugin", "currentPlugin", "selectedPlugin", "pluginData", "mPlugin"):
+            try:
+                if self._plugin_object_matches(get_private_field(fragment, field_name), 0):
+                    return True
+            except:
+                pass
+
+        try:
+            args = fragment.getArguments()
+            if args:
+                for key in ("plugin", "plugin_id", "pluginId", "id", "slug", "name"):
+                    try:
+                        if self._plugin_value_matches(args.getString(key)):
+                            return True
+                    except:
+                        pass
+        except:
+            pass
+
+        try:
+            title = fragment.getTitle()
+            if self._plugin_value_matches(title):
+                return True
+        except:
+            pass
+
+        try:
+            cls = fragment.getClass()
+            if cls:
+                for field in cls.getDeclaredFields():
+                    try:
+                        field.setAccessible(True)
+                        val = field.get(fragment)
+                        if self._plugin_object_matches(val, 0):
+                            return True
+                    except:
+                        pass
+        except:
+            pass
+
+        return False
+
+    def _build_plugin_settings_card(self, ctx, tag):
+        from android.widget import LinearLayout, TextView
+        from android.view import Gravity
+        from android.graphics import Color, Typeface
+        from android.util import TypedValue
+
+        density = ctx.getResources().getDisplayMetrics().density
+
+        def _make_bg(fill, stroke=None, radius_dp=18):
+            try:
+                from android.graphics.drawable import GradientDrawable
+                bg = GradientDrawable()
+                bg.setShape(GradientDrawable.RECTANGLE)
+                bg.setColor(Color.parseColor(fill))
+                if stroke:
+                    bg.setStroke(max(1, int(density)), Color.parseColor(stroke))
+                bg.setCornerRadius(float(radius_dp * density))
+                return bg
+            except:
+                return None
+
+        def _gap(height_dp):
+            gap = TextView(ctx)
+            gap.setHeight(int(height_dp * density))
+            return gap
+
+        def _action_row(badge_text, title_text, subtitle_text, on_click, primary=False):
+            row = LinearLayout(ctx)
+            row.setOrientation(LinearLayout.HORIZONTAL)
+            row.setGravity(Gravity.CENTER_VERTICAL)
+            row.setPadding(int(16 * density), int((16 if primary else 12) * density), int(16 * density), int((16 if primary else 12) * density))
+            try:
+                row.setBackground(_make_bg("#3F8AE0" if primary else "#FFFFFF", "#D7E6FF" if not primary else None, 14))
+            except:
+                pass
+
+            badge = TextView(ctx)
+            badge.setText(badge_text)
+            badge.setTypeface(Typeface.DEFAULT_BOLD)
+            badge.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13 if primary else 12)
+            badge.setPadding(int((10 if primary else 8) * density), int((6 if primary else 5) * density), int((10 if primary else 8) * density), int((6 if primary else 5) * density))
+            try:
+                badge.setTextColor(Color.parseColor("#3F8AE0") if primary else Color.WHITE)
+            except:
+                pass
+            try:
+                badge.setBackground(_make_bg("#FFFFFF" if primary else "#3F8AE0", None, 10))
+            except:
+                pass
+            row.addView(badge)
+
+            spacer = TextView(ctx)
+            spacer.setWidth(int(12 * density))
+            row.addView(spacer)
+
+            labels = LinearLayout(ctx)
+            labels.setOrientation(LinearLayout.VERTICAL)
+
+            title = TextView(ctx)
+            title.setText(title_text)
+            title.setTypeface(Typeface.DEFAULT_BOLD)
+            title.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 17 if primary else 15)
+            try:
+                title.setTextColor(Color.WHITE if primary else Color.parseColor("#202124"))
+            except:
+                pass
+            labels.addView(title)
+
+            subtitle = TextView(ctx)
+            subtitle.setText(subtitle_text)
+            subtitle.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13 if primary else 12)
+            try:
+                subtitle.setTextColor(Color.parseColor("#DCEBFF") if primary else Color.parseColor("#7C7F85"))
+            except:
+                pass
+            labels.addView(subtitle)
+
+            try:
+                row.addView(labels, LinearLayout.LayoutParams(0, -2, 1.0))
+            except:
+                row.addView(labels)
+
+            if not primary:
+                arrow = TextView(ctx)
+                arrow.setText(">")
+                arrow.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15)
+                try:
+                    arrow.setTextColor(Color.parseColor("#3F8AE0"))
+                except:
+                    pass
+                row.addView(arrow)
+
+            row.setClickable(True)
+            row.setOnClickListener(lambda v: on_click())
+            return row
+
+        outer = LinearLayout(ctx)
+        outer.setOrientation(LinearLayout.VERTICAL)
+        outer.setPadding(int(16 * density), int(10 * density), int(16 * density), int(6 * density))
+        try:
+            outer.setTag(tag)
+        except:
+            pass
+
+        card = LinearLayout(ctx)
+        card.setOrientation(LinearLayout.VERTICAL)
+        card.setPadding(int(16 * density), int(16 * density), int(16 * density), int(16 * density))
+        try:
+            card.setBackground(_make_bg("#F4F8FF", "#D7E6FF", 20))
+        except:
+            pass
+
+        badge = TextView(ctx)
+        badge.setText("VLESS")
+        badge.setTypeface(Typeface.DEFAULT_BOLD)
+        badge.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 11)
+        badge.setPadding(int(8 * density), int(4 * density), int(8 * density), int(4 * density))
+        try:
+            badge.setTextColor(Color.parseColor("#3F8AE0"))
+            badge.setBackground(_make_bg("#E7F0FF", None, 10))
+        except:
+            pass
+        card.addView(badge)
+        card.addView(_gap(10))
+
+        title = TextView(ctx)
+        title.setText(Z("vless_quick_actions"))
+        title.setTypeface(Typeface.DEFAULT_BOLD)
+        title.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 18)
+        try:
+            title.setTextColor(Color.parseColor("#202124"))
+        except:
+            pass
+        card.addView(title)
+
+        subtitle = TextView(ctx)
+        subtitle.setText(Z("vless_quick_desc"))
+        subtitle.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13)
+        subtitle.setPadding(0, int(6 * density), 0, int(14 * density))
+        try:
+            subtitle.setTextColor(Color.parseColor("#667085"))
+        except:
+            pass
+        card.addView(subtitle)
+
+        card.addView(_action_row("V", Z("vless_add_key"), Z("vless_paste_hint"), lambda: self._paste_vless_from_clipboard(), True))
+        card.addView(_gap(10))
+        card.addView(_action_row("TG", Z("open_tg_settings"), Z("vless_proxy_short_hint"), lambda: self._open_tg_proxy_settings(), False))
+        card.addView(_gap(10))
+
+
+        outer.addView(card)
+        return outer
+
+    def _inject_plugin_settings_card(self, fragment, result):
+        try:
+            from android.view import ViewGroup
+        except:
+            return
+
+        if result is None or not self._is_our_plugin_settings_fragment(fragment):
+            return
+
+        try:
+            ctx = fragment.getParentActivity()
+        except:
+            ctx = None
+        if not ctx:
+            try:
+                frag = get_last_fragment()
+                ctx = frag.getParentActivity() if frag else ApplicationLoader.applicationContext
+            except:
+                ctx = ApplicationLoader.applicationContext
+
+        inserted = False
+        try:
+            if isinstance(result, ViewGroup):
+                if not self._view_group_has_tag(result, PLUGIN_SETTINGS_CARD_TAG):
+                    result.addView(self._build_plugin_settings_card(ctx, PLUGIN_SETTINGS_CARD_TAG), 0)
+                    inserted = True
+            else:
+                parent = result.getParent() if hasattr(result, "getParent") else None
+                if parent and isinstance(parent, ViewGroup) and not self._view_group_has_tag(parent, PLUGIN_SETTINGS_CARD_TAG):
+                    entry = self._build_plugin_settings_card(ctx, PLUGIN_SETTINGS_CARD_TAG)
+                    idx = -1
+                    for i in range(parent.getChildCount()):
+                        if parent.getChildAt(i) == result:
+                            idx = i
+                            break
+                    if idx >= 0:
+                        parent.addView(entry, idx)
+                    else:
+                        parent.addView(entry, 0)
+                    inserted = True
+        except Exception as e:
+            _log(f"inject plugin settings card error: {e}")
+            return
+
+        try:
+            if inserted and not getattr(self, "_plugin_settings_card_ready", False):
+                self._plugin_settings_card_ready = True
+                self._reload_settings_ui()
+        except:
+            pass
+
+    def _install_settings_hooks(self):
+        plugin_ref = self
+
+        # Hook into Telegram main settings (ProfileActivity / SettingsActivity)
+        try:
+            class _SettingsCreateViewHook(MethodHook):
+                def after_hooked_method(self, param):
+                    try:
+                        result = param.getResult()
+                        plugin_ref._inject_settings_shortcut(result, MAIN_SETTINGS_ENTRY_TAG, False)
+                    except:
+                        pass
+
+            for cls_name in (
+                "org.telegram.ui.ProfileActivity",
+                "org.telegram.ui.SettingsActivity",
+                "com.exteragram.messenger.preferences.MainPreferencesActivity",
+            ):
+                try:
+                    SettingsActivity = find_class(cls_name)
+                    if SettingsActivity:
+                        for m in SettingsActivity.getDeclaredMethods():
+                            if m.getName() == "createView" and len(m.getParameterTypes()) == 1:
+                                self.hook_method(m, _SettingsCreateViewHook())
+                                _log(f"settings hook installed: {cls_name}.createView")
+                                break
+                except:
+                    pass
+        except Exception as e:
+            _log(f"settings hook install error: {e}")
+
+        # Hook into ProxyListActivity (proxy settings)
+        try:
+            class _ProxyListCreateViewHook(MethodHook):
+                def after_hooked_method(self, param):
+                    try:
+                        result = param.getResult()
+                        plugin_ref._inject_settings_shortcut(result, PROXY_SETTINGS_ENTRY_TAG, True)
+                    except:
+                        pass
+
+            for cls_name in (
+                "org.telegram.ui.ProxyListActivity",
+                "org.telegram.ui.ProxySettingsActivity",
+            ):
+                try:
+                    ProxyActivity = find_class(cls_name)
+                    if ProxyActivity:
+                        for m in ProxyActivity.getDeclaredMethods():
+                            if m.getName() == "createView" and len(m.getParameterTypes()) == 1:
+                                self.hook_method(m, _ProxyListCreateViewHook())
+                                _log(f"proxy hook installed: {cls_name}.createView")
+                                break
+                except:
+                    pass
+        except Exception as e:
+            _log(f"proxy list hook install error: {e}")
+
+        try:
+            class _PluginSettingsCreateViewHook(MethodHook):
+                def after_hooked_method(self, param):
+                    try:
+                        result = param.getResult()
+                        try:
+                            fragment = param.thisObject
+                        except:
+                            fragment = getattr(param, "thisObject", None)
+                        plugin_ref._inject_plugin_settings_card(fragment, result)
+                    except:
+                        pass
+
+            PluginSettingsActivity = find_class("com.exteragram.messenger.plugins.ui.PluginSettingsActivity")
+            if PluginSettingsActivity:
+                for m in PluginSettingsActivity.getDeclaredMethods():
+                    if m.getName() == "createView" and len(m.getParameterTypes()) == 1:
+                        self.hook_method(m, _PluginSettingsCreateViewHook())
+                        _log("settings hook installed: PluginSettingsActivity.createView")
+                        break
+        except Exception as e:
+            _log(f"plugin settings hook install error: {e}")
+
+    def _remove_menu_items(self):
+        for mid in (self._chat_menu_item_id, self._drawer_menu_item_id, self._profile_menu_item_id):
+            try:
+                self.remove_menu_item(mid)
+            except:
+                pass
+
+    def _open_settings(self):
+        try:
+            PC = find_class("com.exteragram.messenger.plugins.PluginsController")
+        except:
+            PC = None
+        try:
+            PSA = find_class("com.exteragram.messenger.plugins.ui.PluginSettingsActivity")
+        except:
+            PSA = None
+
+        try:
+            if PC:
+                inst = None
+                try:
+                    inst = PC.getInstance()
+                except:
+                    inst = None
+                if inst is not None and hasattr(inst, "plugins") and PSA:
+                    plugin_obj = None
+                    try:
+                        plugin_obj = inst.plugins.get(self.id)
+                    except:
+                        plugin_obj = None
+                    if plugin_obj is not None:
+                        frag = get_last_fragment()
+                        if frag is not None:
+                            _log("open_settings: PluginSettingsActivity")
+                            frag.presentFragment(PSA(plugin_obj))
+                            return
+                try:
+                    _log("open_settings: PC.openPluginSettings(self.id)")
+                    PC.openPluginSettings(self.id)
+                    return
+                except:
+                    try:
+                        _log("open_settings: PC.openPluginSettings('bobrsocks')")
+                        PC.openPluginSettings("bobrsocks")
+                        return
+                    except:
+                        pass
+            frag = get_last_fragment()
+            if frag and PC:
+                _log("open_settings: PluginsController.getInstance().openPluginSettings")
+                PC.getInstance().openPluginSettings(self.id, frag)
+        except:
+            pass
+
+    def _on_enabled_changed(self, v):
+        try:
+            enabled = bool(v)
+            _log(f"on_enabled_changed: enabled={enabled} active_uri={bool(self._vless_active_uri)}")
+            if enabled:
+                if self._vless_active_uri:
+                    threading.Thread(target=self._vless_connect, daemon=True).start()
+                else:
+                    _log("on_enabled_changed: no active VLESS URI")
+                    self.set_setting("vless_enabled", False, reload_settings=True)
+            else:
+                self._vless_disconnect()
+        except Exception:
+            _log_exc("on_enabled_changed crash")
+
+    def _on_vless_custom_key_input(self, v):
+        text = str(v or "")
+        uris = _extract_proxy_uris(text)
+        if len(uris) > 1:
+            key = "\n".join(uris)
+            if key != self._last_custom_key_applied:
+                self._last_custom_key_applied = key
+                self._apply_vless_custom_keys(uris)
+            return
+        uri = _sanitize_vless_uri(text)
+        self._vless_custom_key_buf = uri
+        is_vmess = uri.startswith("vmess://") and len(uri) > 15
+        is_std = _is_proxy_uri(uri) and "@" in uri
+        if (is_vmess or is_std) and uri != self._last_custom_key_applied:
+            self._last_custom_key_applied = uri
+            self._apply_vless_custom_key()
+
+    def _apply_vless_custom_key(self):
+        uri = _sanitize_vless_uri(getattr(self, "_vless_custom_key_buf", ""))
+        if not _is_proxy_uri(uri) or len(uri) < 15:
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Неверный ключ (vless/vmess/trojan/ss)")); return
+        conf, name = VlessConfigParser.parse(uri, 1080)
+        if not conf:
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Ошибка парсинга ключа")); return
+        manual = self._vless_data.get("manual", [])
+        if not any(n["uri"] == uri for n in manual):
+            manual.append({"name": name, "uri": uri, "ping": -1})
+            self._vless_data["manual"] = manual
+        self._vless_active_uri = uri
+        self._vless_save_data()
+        self._ping_event.set()
+        try:
+            self.set_setting("vless_custom_key", "", reload_settings=False)
+        except:
+            pass
+        self._vless_custom_key_buf = ""
+        self._last_custom_key_applied = ""
+        try:
+            self.set_setting("vless_enabled", True, reload_settings=True)
+        except:
+            pass
+        run_on_ui_thread(lambda: BulletinHelper.show_success(Z("key_added")))
+        threading.Thread(target=self._vless_connect, daemon=True).start()
+        run_on_ui_thread(self._reload_settings_ui)
+
+    def _apply_vless_custom_keys(self, uris):
+        if not uris:
+            return
+        manual = self._vless_data.get("manual", [])
+        added = 0
+        last_uri = None
+        for uri in uris:
+            uri = _sanitize_vless_uri(uri)
+            if not _is_proxy_uri(uri) or len(uri) < 15:
+                continue
+            conf, name = VlessConfigParser.parse(uri, 1080)
+            if not conf:
+                continue
+            if not any(n["uri"] == uri for n in manual):
+                manual.append({"name": name, "uri": uri, "ping": -1})
+                added += 1
+            last_uri = uri
+        if added == 0 and last_uri is None:
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Неверный ключ (vless/vmess/trojan/ss)"))
+            return
+        self._vless_data["manual"] = manual
+        self._vless_active_uri = last_uri
+        self._vless_save_data()
+        self._ping_event.set()
+        self._vless_custom_key_buf = ""
+        self._last_custom_key_applied = ""
+        try:
+            self.set_setting("vless_enabled", True, reload_settings=True)
+        except:
+            pass
+        msg = Z("key_added") if added <= 1 else Z("keys_added").format(count=added)
+        run_on_ui_thread(lambda: BulletinHelper.show_success(msg))
+        threading.Thread(target=self._vless_connect, daemon=True).start()
+        run_on_ui_thread(self._reload_settings_ui)
+
+    def _on_vless_custom_sub_input(self, v):
+        raw = str(v or "")
+        self._vless_custom_sub_buf = raw
+        urls = self._extract_sub_urls(raw)
+        if not urls:
+            return
+        sig = "\n".join(urls)
+        if sig != self._last_custom_sub_applied:
+            self._last_custom_sub_applied = sig
+            self._apply_vless_custom_sub()
+
+    def _extract_sub_urls(self, raw_text):
+        try:
+            text = str(raw_text or "")
+        except:
+            return []
+        try:
+            found = re.findall(r"https?://[^\s<>\"']+", text)
+        except:
+            found = []
+        urls = []
+        seen = set()
+        for u in found:
+            try:
+                u2 = str(u or "").strip().rstrip(",.;)")
+                if not u2.startswith("http") or len(u2) < 10:
+                    continue
+                if u2 in seen:
+                    continue
+                seen.add(u2)
+                urls.append(u2)
+            except:
+                continue
+        return urls
+
+    def _apply_vless_custom_sub(self):
+        urls = self._extract_sub_urls(getattr(self, "_vless_custom_sub_buf", ""))
+        if not urls:
+            run_on_ui_thread(lambda: BulletinHelper.show_error(Z("vless_custom_sub_bad")))
+            return
+        try:
+            self.set_setting("vless_custom_sub_url", urls[0])
+            self._vless_custom_sub_url = urls[0]
+        except:
+            pass
+        def _worker(all_urls):
+            for u in all_urls:
+                try:
+                    self._vless_do_add_sub(u)
+                except:
+                    pass
+        threading.Thread(target=_worker, args=(urls,), daemon=True).start()
+
+    def _reload_settings_ui(self):
+        def _do():
+            try:
+                self.set_setting("__reload__", time.time(), reload_settings=True)
+            except: pass
+        run_on_ui_thread(_do, 100)
+
+    def _open_tg_proxy_settings(self):
+        try:
+            frag = get_last_fragment()
+            if frag:
+                from org.telegram.ui import ProxyListActivity
+                frag.presentFragment(ProxyListActivity())
+        except: pass
+
+    def _open_tg_link(self, url):
+        try:
+            url = str(url or "").strip()
+            if not url: return
+            _log(f"open link: {url}")
+            try:
+                frag = get_last_fragment()
+                act = frag.getParentActivity() if frag else None
+            except:
+                act = None
+
+            try:
+                from org.telegram.messenger.browser import Browser
+            except:
+                Browser = None
+
+            ctx = act if act else ApplicationLoader.applicationContext
+            if Browser:
+                _log(f"open link via Browser.openUrl (ctx={type(ctx)})")
+                Browser.openUrl(ctx, url)
+                return
+
+            from android.content import Intent
+            from android.net import Uri
+            intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            if not act:
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            ctx.startActivity(intent)
+        except:
+            pass
+
+    def _get_proxy_port(self):
+        try:
+            if self._vless_running and self._vless_port:
+                return int(self._vless_port)
+        except:
+            pass
+        return 0
+
+    def _vless_save_data(self):
+        self._vless_data["active_uri"] = self._vless_active_uri
+        self.set_setting("vless_data", self._vless_data)
+
+    def _vless_new_connect_token(self):
+        try:
+            with self._vless_token_lock:
+                self._vless_connect_token += 1
+                return int(self._vless_connect_token)
+        except:
+            try:
+                self._vless_connect_token += 1
+                return int(self._vless_connect_token)
+            except:
+                return 0
+
+    def _vless_is_token_current(self, token):
+        try:
+            with self._vless_token_lock:
+                return int(token) == int(self._vless_connect_token)
+        except:
+            return False
+
+    def _vless_pick_port(self):
+        try:
+            p = int(getattr(self, "_vless_port", 0) or 0)
+        except:
+            p = 0
+        if p > 0:
+            try:
+                if not _check_vless_port(p, timeout=0.05):
+                    return p
+            except:
+                pass
+        return _get_free_port()
+
+    def _ensure_vless_locks(self):
+        try:
+            if not hasattr(self, "_vless_start_lock") or self._vless_start_lock is None:
+                self._vless_start_lock = threading.Lock()
+            if not hasattr(self, "_vless_token_lock") or self._vless_token_lock is None:
+                self._vless_token_lock = threading.Lock()
+            if not hasattr(self, "_vless_connect_token"):
+                self._vless_connect_token = 0
+        except Exception:
+            _log_exc("ensure_vless_locks")
+
+    def _vless_connect(self):
+        try:
+            self._ensure_vless_locks()
+
+            uri = _sanitize_vless_uri(self._vless_active_uri)
+            if not uri:
+                _log("vless_connect: empty uri")
+                return
+            self._vless_active_uri = uri
+
+            token = self._vless_new_connect_token()
+            _log(f"vless_connect: start token={token}")
+
+            try:
+                if self._vless_running and self._vless_running_uri == uri and _check_vless_port(self._vless_port, timeout=0.05):
+                    _log(f"vless_connect: already running on port={self._vless_port}")
+                    _vless_apply_tg_proxy(self._vless_port, True)
+                    try:
+                        self.set_setting("vless_enabled", True, reload_settings=True)
+                    except:
+                        pass
+                    return
+            except Exception:
+                _log_exc("vless_connect reapply existing")
+
+            if not self._vless_core.is_available():
+                _log("vless_connect: core unavailable")
+                threading.Thread(target=self._download_xray_and_reload_bg, args=(None,), daemon=True).start()
+                return
+
+            port = self._vless_pick_port()
+            config_json, _ = VlessConfigParser.parse(uri, port)
+            if not config_json:
+                _log("vless_connect: parse returned empty config")
+                self.set_setting("vless_enabled", False, reload_settings=True); return
+
+            try:
+                _log(f"vless_connect: xray config: {config_json}")
+            except Exception:
+                pass
+
+            # Compatibility fallback: many links use fp=randomized and alpn includes h3.
+            # Some servers reject such TLS ClientHello for TCP transport.
+            fallback_json = None
+            try:
+                _cfg = json.loads(config_json)
+                _ob = None
+                try:
+                    _ob = _cfg.get("outbounds", [])[0]
+                except:
+                    _ob = None
+                _changed = False
+                if isinstance(_ob, dict):
+                    _ss = _ob.get("streamSettings") or {}
+                    if isinstance(_ss, dict):
+                        _tls = _ss.get("tlsSettings") or {}
+                        if isinstance(_tls, dict):
+                            _fp = str(_tls.get("fingerprint", "") or "").lower().strip()
+                            if _fp in ("randomized", "random", "rand"):
+                                _tls["fingerprint"] = "chrome"
+                                _changed = True
+                            _alpn = _tls.get("alpn")
+                            if isinstance(_alpn, list):
+                                _new_alpn = [a for a in _alpn if str(a).lower() != "h3"]
+                                if _new_alpn != _alpn:
+                                    _tls["alpn"] = _new_alpn
+                                    _changed = True
+                        _ss["tlsSettings"] = _tls
+                    _ob["streamSettings"] = _ss
+                    _cfg["outbounds"][0] = _ob
+                if _changed:
+                    fallback_json = json.dumps(_cfg)
+            except Exception as _fe:
+                _log(f"vless_connect: fallback prep error: {_fe}")
+
+            err = ""
+            with self._vless_start_lock:
+                if not self._vless_is_token_current(token):
+                    _log(f"vless_connect: stale token before start token={token}")
+                    return
+
+                try:
+                    self._vless_core.stop()
+                except:
+                    pass
+
+                self._vless_running = False
+                self._vless_running_uri = ""
+                self._vless_port = port
+
+                _log(f"vless_connect: starting core on port={port}")
+                try:
+                    err = self._vless_core.start(config_json)
+                except Exception as e:
+                    err = str(e)
+
+            if err:
+                _log(f"vless_connect: core error: {err}")
+                self.set_setting("vless_enabled", False, reload_settings=True); return
+
+            deadline = time.time() + float(VLESS_READY_WAIT_SEC)
+            while time.time() < deadline:
+                if not self._vless_is_token_current(token):
+                    _log(f"vless_connect: stale token during wait token={token}")
+                    return
+                if _check_vless_port(port, timeout=0.05):
+                    _log(f"vless_connect: port ready port={port}")
+                    try:
+                        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _vs:
+                            _vs.settimeout(2.0)
+                            _vs.connect(('127.0.0.1', port))
+                            _vs.sendall(b'\x05\x01\x00')
+                            _vr = _vs.recv(2)
+                            if len(_vr) == 2 and _vr[0] == 0x05:
+                                _log(f"vless_connect: SOCKS5 handshake OK method={_vr[1]}")
+                            else:
+                                _log(f"vless_connect: SOCKS5 handshake bad resp={_vr.hex() if _vr else 'empty'}")
+                    except Exception as _ve:
+                        _log(f"vless_connect: SOCKS5 verify error: {_ve}")
+                    # test real data path through SOCKS5 -> VLESS -> TLS endpoint
+                    _ok, _msg = _check_proxy_tunnel(port, timeout=6.0)
+                    if not self._vless_is_token_current(token):
+                        _log(f"vless_connect: stale token after probe token={token}")
+                        return
+                    if _ok:
+                        _log(f"vless_connect: tunnel probe OK: {_msg}")
+                    else:
+                        _log(f"vless_connect: tunnel probe failed: {_msg}")
+                        _did_retry = False
+                        try:
+                            if fallback_json and ("tls probe failed" in str(_msg).lower() or "connection reset" in str(_msg).lower()):
+                                _did_retry = True
+                                _log("vless_connect: retry with TLS fallback (fp=chrome, alpn without h3)")
+                                if not self._vless_is_token_current(token):
+                                    _log(f"vless_connect: stale token before fallback retry token={token}")
+                                    return
+                                with self._vless_start_lock:
+                                    try:
+                                        self._vless_core.stop()
+                                    except:
+                                        pass
+                                    _err2 = self._vless_core.start(fallback_json)
+                                if _err2:
+                                    _log(f"vless_connect: fallback start error: {_err2}")
+                                else:
+                                    time.sleep(0.25)
+                                    _ok2, _msg2 = _check_proxy_tunnel(port, timeout=6.0)
+                                    if not self._vless_is_token_current(token):
+                                        _log(f"vless_connect: stale token after fallback probe token={token}")
+                                        return
+                                    if _ok2:
+                                        _log("vless_connect: tunnel probe OK after fallback")
+                                    else:
+                                        _log(f"vless_connect: tunnel probe still failed after fallback: {_msg2}")
+                        except Exception as _re:
+                            _log(f"vless_connect: fallback retry error: {_re}")
+                        if _did_retry:
+                            try:
+                                _ok, _msg = _check_proxy_tunnel(port, timeout=6.0)
+                            except:
+                                pass
+                    if not self._vless_is_token_current(token):
+                        _log(f"vless_connect: stale token before apply token={token}")
+                        return
+                    _vless_apply_tg_proxy(port, True)
+                    self._vless_running = True
+                    self._vless_running_uri = uri
+                    try:
+                        self.set_setting("vless_enabled", True, reload_settings=True)
+                    except:
+                        pass
+                    run_on_ui_thread(self._reload_settings_ui)
+                    return
+                time.sleep(float(VLESS_READY_POLL_SEC))
+
+            if not self._vless_is_token_current(token):
+                _log(f"vless_connect: stale token after timeout token={token}")
+                return
+
+            _log("vless_connect: port timeout")
+            with self._vless_start_lock:
+                try:
+                    self._vless_core.stop()
+                except:
+                    pass
+            self._vless_running = False
+            self._vless_running_uri = ""
+            _vless_apply_tg_proxy(0, False)
+            self.set_setting("vless_enabled", False, reload_settings=True)
+            run_on_ui_thread(self._reload_settings_ui)
+        except Exception:
+            _log_exc("vless_connect crash")
+            try:
+                self.set_setting("vless_enabled", False, reload_settings=True)
+            except:
+                pass
+
+    def _vless_disconnect(self, silent=False):
+        try:
+            self._ensure_vless_locks()
+            token = self._vless_new_connect_token()
+            _log(f"vless_disconnect: token={token} silent={silent}")
+            with self._vless_start_lock:
+                try:
+                    self._vless_core.stop()
+                except:
+                    pass
+            self._vless_running = False
+            self._vless_running_uri = ""
+            _vless_apply_tg_proxy(0, False)
+            if not silent:
+                self._reload_settings_ui()
+        except Exception:
+            _log_exc("vless_disconnect crash")
+
+    def _make_vless_node_select(self, uri):
+        def handler(v):
+            self._vless_active_uri = uri
+            self._vless_save_data()
+            if self.get_setting("vless_enabled", True):
+                threading.Thread(target=self._vless_connect, daemon=True).start()
+            self._reload_settings_ui()
+        return handler
+
+    def _make_node_options(self, idx, source, node):
+        def handler(v):
+            try:
+                frag = get_last_fragment()
+                act = frag.getParentActivity() if frag else None
+                if not act:
+                    self._make_vless_node_select(node["uri"])(v)
+                    return
+
+                uri = node["uri"]
+                menu_items = [Z("node_connect"), Z("node_rename"), Z("node_delete")]
+
+                def on_item(dlg, which):
+                    w = int(which)
+                    if w == 0:
+                        self._make_vless_node_select(uri)(None)
+                    elif w == 1:
+                        self._rename_manual_node(idx, act)
+                    elif w == 2:
+                        self._delete_manual_node(idx, act)
+
+                b = AlertDialogBuilder(act)
+                b.set_title(node["name"])
+                b.set_items(menu_items, on_item)
+                b.set_negative_button(Z("btn_cancel"), lambda d, w: d.dismiss())
+                b.show()
+            except Exception as e:
+                _log(f"node options error: {e}")
+                self._make_vless_node_select(node["uri"])(v)
+        return handler
+
+    def _delete_manual_node(self, idx, act):
+        manual = self._vless_data.get("manual", [])
+        if idx < 0 or idx >= len(manual):
+            return
+
+        def do_delete():
+            node = manual[idx]
+            uri = node["uri"]
+            manual.pop(idx)
+            self._vless_data["manual"] = manual
+            if self._vless_active_uri == uri:
+                self._vless_active_uri = ""
+                self._vless_disconnect(silent=True)
+            self._vless_save_data()
+            self._reload_settings_ui()
+
+        try:
+            b = AlertDialogBuilder(act)
+            b.set_title(Z("node_delete"))
+            b.set_message(Z("node_delete_confirm"))
+            b.set_negative_button(Z("btn_cancel"), lambda d, w: d.dismiss())
+            b.set_positive_button(Z("btn_delete"), lambda d, w: (d.dismiss(), do_delete()))
+            try:
+                b.make_button_red(AlertDialogBuilder.BUTTON_POSITIVE)
+            except:
+                pass
+            b.show()
+        except:
+            do_delete()
+
+    def _rename_manual_node(self, idx, act):
+        manual = self._vless_data.get("manual", [])
+        if idx < 0 or idx >= len(manual):
+            return
+        try:
+            from android.widget import EditText
+            inp = EditText(act)
+            inp.setText(manual[idx]["name"])
+            inp.setSelection(len(manual[idx]["name"]))
+
+            def do_rename(d, w):
+                try:
+                    new_name = str(inp.getText()).strip()
+                    if new_name:
+                        manual[idx]["name"] = new_name
+                        self._vless_data["manual"] = manual
+                        self._vless_save_data()
+                        self._reload_settings_ui()
+                except:
+                    pass
+                d.dismiss()
+
+            b = AlertDialogBuilder(act)
+            b.set_title(Z("node_rename_title"))
+            b.set_view(inp)
+            b.set_positive_button("OK", do_rename)
+            b.set_negative_button(Z("btn_cancel"), lambda d, w: d.dismiss())
+            b.show()
+        except Exception as e:
+            _log(f"rename node error: {e}")
+
+    def _show_clipboard_add_dialog(self, uris_or_uri):
+        if isinstance(uris_or_uri, str):
+            uris = [uris_or_uri]
+        else:
+            uris = list(uris_or_uri or [])
+        if not uris:
+            return
+        def _do():
+            try:
+                frag = get_last_fragment()
+                act = frag.getParentActivity() if frag else None
+                if not act:
+                    return
+
+                if len(uris) == 1:
+                    _, name = VlessConfigParser.parse(uris[0], 1080)
+                    if not name:
+                        name = Z("vless_node_default")
+                    short = uris[0][:60] + "..." if len(uris[0]) > 60 else uris[0]
+                    msg = f"{name}\n\n{short}"
+                    title = Z("clipboard_found")
+                else:
+                    title = Z("clipboard_found_multi").format(count=len(uris))
+                    lines = []
+                    for u in uris[:10]:
+                        _, n = VlessConfigParser.parse(u, 1080)
+                        lines.append(n or Z("vless_node_default"))
+                    msg = "\n".join(lines)
+                    if len(uris) > 10:
+                        msg += f"\n...и ещё {len(uris) - 10}"
+
+                def do_add(d, w):
+                    d.dismiss()
+                    if len(uris) == 1:
+                        self._vless_custom_key_buf = uris[0]
+                        self._last_custom_key_applied = uris[0]
+                        self._apply_vless_custom_key()
+                    else:
+                        self._apply_vless_custom_keys(uris)
+
+                b = AlertDialogBuilder(act)
+                b.set_title(title)
+                b.set_message(msg)
+                b.set_positive_button(Z("btn_add"), do_add)
+                b.set_negative_button(Z("btn_cancel"), lambda d, w: d.dismiss())
+                b.show()
+            except Exception as e:
+                _log(f"clipboard dialog error: {e}")
+        run_on_ui_thread(_do)
+
+    def _vless_open_nodes_menu(self):
+        frag = get_last_fragment()
+        if not frag: return
+        builder = AlertDialogBuilder(frag.getParentActivity())
+        items = [Z("vless_nodes_update"), Z("vless_nodes_clear")]
+
+        cancel_text = Z("btn_cancel")
+        builder.set_negative_button(cancel_text)
+
+        def on_item(dlg, which):
+            try:
+                if int(which) == 0:
+                    threading.Thread(target=self._vless_update_all_subs, daemon=True).start()
+                elif int(which) == 1:
+                    self._vless_clear_user_nodes()
+            except Exception as e:
+                _log(f"nodes menu error: {e}")
+
+        builder.set_title(Z("vless_nodes_manage"))
+        builder.set_items(items, on_item)
+        builder.set_negative_button(cancel_text, lambda d, w: d.dismiss())
+        builder.show()
+
+    def _vless_update_all_subs(self):
+        urls = [s.get("url", "") for s in self._vless_data.get("subs", []) if s.get("url")]
+        try:
+            u = str(self.get_setting("vless_custom_sub_url", "") or "").strip()
+            if u and u not in urls:
+                urls.insert(0, u)
+        except:
+            pass
+        for url in urls:
+            self._vless_update_sub(url)
+
+    def _vless_clear_user_nodes(self):
+        self._vless_data["manual"] = []
+        self._vless_data["subs"] = []
+        if self._vless_active_uri:
+            self._vless_active_uri = ""
+            self._vless_disconnect(silent=True)
+        self._vless_save_data()
+        self._reload_settings_ui()
+
+    def _vless_do_add_sub(self, url):
+        if not url.startswith("http"): return
+        nodes = _fetch_vless_nodes(url)
+        if not nodes:
+            def _notify():
+                try:
+                    try:
+                        r = requests.get(url, timeout=15)
+                        t = (r.text or "").strip()
+                    except:
+                        t = ""
+                    low = t.lower()
+                    if "приложение не поддерживается" in low or "not supported" in low:
+                        BulletinHelper.show_error(Z("vless_app_not_supported"))
+                    else:
+                        BulletinHelper.show_error(Z("vless_custom_sub_empty"))
+                except:
+                    BulletinHelper.show_error(Z("vless_custom_sub_empty"))
+
+            run_on_ui_thread(_notify)
+            return
+        if nodes:
+            if "subs" not in self._vless_data: self._vless_data["subs"] = []
+            existing = [s["url"] for s in self._vless_data["subs"]]
+            if url not in existing:
+                self._vless_data["subs"].append({
+                    "id": url,
+                    "url": url,
+                    "name": urllib.parse.urlparse(url).netloc,
+                    "nodes": nodes
+                })
+            self._vless_save_data()
+            self._ping_event.set()
+            run_on_ui_thread(self._reload_settings_ui)
+
+    def _vless_update_sub(self, url):
+        nodes = _fetch_vless_nodes(url)
+        changed = False
+        for sub in self._vless_data.get("subs", []):
+            if sub["url"] == url and nodes:
+                sub["nodes"] = nodes
+                changed = True
+        if not changed and nodes:
+            try:
+                if "subs" not in self._vless_data:
+                    self._vless_data["subs"] = []
+                existing = [s.get("url", "") for s in self._vless_data.get("subs", [])]
+                if url not in existing:
+                    self._vless_data["subs"].append({
+                        "id": url,
+                        "url": url,
+                        "name": urllib.parse.urlparse(url).netloc,
+                        "nodes": nodes
+                    })
+                    changed = True
+            except:
+                pass
+        if changed:
+            self._vless_save_data()
+            self._ping_event.set()
+            run_on_ui_thread(self._reload_settings_ui)
+
+    def _save_subs_collapsed(self):
+        try:
+            self.set_setting("subs_collapsed", self._subs_collapsed, reload_settings=False)
+        except:
+            pass
+
+    def _get_sub_collapsed(self, sub_url, is_active_sub=False):
+        try:
+            url = str(sub_url or "")
+            if not url:
+                return False
+            state = self._subs_collapsed
+            if not isinstance(state, dict):
+                state = {}
+                self._subs_collapsed = state
+            if url not in state:
+                state[url] = False if is_active_sub else True
+                self._save_subs_collapsed()
+            return bool(state.get(url, False))
+        except:
+            return False
+
+    def _make_sub_toggle(self, sub_url, is_active_sub=False):
+        def handler(v):
+            try:
+                url = str(sub_url or "")
+                if not url:
+                    return
+                current = self._get_sub_collapsed(url, is_active_sub)
+                self._subs_collapsed[url] = not current
+                self._save_subs_collapsed()
+                self._reload_settings_ui()
+            except Exception as e:
+                _log(f"sub toggle error: {e}")
+        return handler
+
+    def _make_sub_options(self, sub_url):
+        def handler(v):
+            try:
+                url = str(sub_url or "").strip()
+                if not url:
+                    return
+                frag = get_last_fragment()
+                act = frag.getParentActivity() if frag else None
+                if not act:
+                    threading.Thread(target=self._vless_update_sub, args=(url,), daemon=True).start()
+                    return
+
+                menu_items = [Z("vless_sub_update"), Z("vless_sub_rename"), Z("vless_sub_delete")]
+
+                def on_item(dlg, which):
+                    w = int(which)
+                    if w == 0:
+                        threading.Thread(target=self._vless_update_sub, args=(url,), daemon=True).start()
+                    elif w == 1:
+                        self._rename_sub(url, act)
+                    elif w == 2:
+                        self._delete_sub(url, act)
+
+                title = None
+                for s in self._vless_data.get("subs", []):
+                    try:
+                        if s.get("url") == url:
+                            title = s.get("name")
+                            break
+                    except:
+                        pass
+
+                b = AlertDialogBuilder(act)
+                if title:
+                    b.set_title(str(title))
+                b.set_items(menu_items, on_item)
+                b.set_negative_button(Z("btn_cancel"), lambda d, w: d.dismiss())
+                b.show()
+            except Exception as e:
+                _log(f"sub options error: {e}")
+        return handler
+
+    def _rename_sub(self, url, act):
+        try:
+            target = None
+            for s in self._vless_data.get("subs", []):
+                if s.get("url") == url:
+                    target = s
+                    break
+            if not target:
+                return
+
+            from android.widget import EditText
+            inp = EditText(act)
+            old_name = str(target.get("name") or "")
+            inp.setText(old_name)
+            inp.setSelection(len(old_name))
+
+            def do_rename(d, w):
+                try:
+                    new_name = str(inp.getText() or "").strip()
+                    if new_name:
+                        target["name"] = new_name
+                        self._vless_save_data()
+                        self._reload_settings_ui()
+                except:
+                    pass
+                d.dismiss()
+
+            b = AlertDialogBuilder(act)
+            b.set_title(Z("vless_sub_rename_title"))
+            b.set_view(inp)
+            b.set_positive_button("OK", do_rename)
+            b.set_negative_button(Z("btn_cancel"), lambda d, w: d.dismiss())
+            b.show()
+        except Exception as e:
+            _log(f"rename sub error: {e}")
+
+    def _delete_sub(self, url, act):
+        def do_delete():
+            try:
+                subs = self._vless_data.get("subs", [])
+                kept = []
+                removed_nodes = []
+                for s in subs:
+                    if s.get("url") == url:
+                        try:
+                            removed_nodes.extend([n.get("uri") for n in s.get("nodes", []) if n.get("uri")])
+                        except:
+                            pass
+                        continue
+                    kept.append(s)
+                self._vless_data["subs"] = kept
+                try:
+                    if url in self._subs_collapsed:
+                        del self._subs_collapsed[url]
+                        self._save_subs_collapsed()
+                except:
+                    pass
+                if self._vless_active_uri and self._vless_active_uri in removed_nodes:
+                    self._vless_active_uri = ""
+                    self._vless_disconnect(silent=True)
+                self._vless_save_data()
+                self._reload_settings_ui()
+            except Exception as e:
+                _log(f"delete sub error: {e}")
+
+        try:
+            b = AlertDialogBuilder(act)
+            b.set_title(Z("vless_sub_delete"))
+            b.set_message(Z("vless_sub_delete_confirm"))
+            b.set_negative_button(Z("btn_cancel"), lambda d, w: d.dismiss())
+            b.set_positive_button(Z("btn_delete"), lambda d, w: (d.dismiss(), do_delete()))
+            try:
+                b.make_button_red(AlertDialogBuilder.BUTTON_POSITIVE)
+            except:
+                pass
+            b.show()
+        except:
+            do_delete()
+
+    def _health_check_loop(self):
+        while not self._health_stop.is_set():
+            self._health_stop.wait(HEALTH_CHECK_INTERVAL_SEC)
+            if self._health_stop.is_set():
+                break
+            try:
+                if not self.get_setting("auto_switch_enabled", False):
+                    self._health_fail_count = 0
+                    continue
+                if not self.get_setting("vless_enabled", True):
+                    self._health_fail_count = 0
+                    continue
+                if not self._vless_running:
+                    self._health_fail_count = 0
+                    continue
+                port = self._vless_port
+                if not port:
+                    continue
+                alive = self._check_proxy_alive(port)
+                if alive:
+                    self._health_fail_count = 0
+                    continue
+                self._health_fail_count += 1
+                _log(f"health_check: fail count={self._health_fail_count} port={port}")
+                if self._health_fail_count >= HEALTH_CHECK_FAIL_THRESHOLD:
+                    self._health_fail_count = 0
+                    self._auto_switch_to_best()
+            except:
+                _log_exc("health_check_loop error")
+
+    def _on_profile_recheck_interval_input(self, v):
+        try:
+            raw = str(v or "").strip()
+            if not raw:
+                self.set_setting("profile_recheck_interval_sec", str(int(PROFILE_RECHECK_INTERVAL_SEC_DEFAULT)), reload_settings=False)
+                return
+            sec = float(raw)
+            if sec < PROFILE_RECHECK_INTERVAL_SEC_MIN:
+                sec = PROFILE_RECHECK_INTERVAL_SEC_MIN
+            self.set_setting("profile_recheck_interval_sec", str(int(sec)), reload_settings=False)
+        except:
+            try:
+                self.set_setting("profile_recheck_interval_sec", str(int(PROFILE_RECHECK_INTERVAL_SEC_DEFAULT)), reload_settings=False)
+            except:
+                pass
+
+    def _get_profile_recheck_interval_sec(self):
+        try:
+            raw = self.get_setting("profile_recheck_interval_sec", str(int(PROFILE_RECHECK_INTERVAL_SEC_DEFAULT)))
+            sec = float(str(raw or "").strip())
+            if sec < PROFILE_RECHECK_INTERVAL_SEC_MIN:
+                sec = PROFILE_RECHECK_INTERVAL_SEC_MIN
+            return sec
+        except:
+            return PROFILE_RECHECK_INTERVAL_SEC_DEFAULT
+
+    def _profile_recheck_once(self, port):
+        try:
+            for ac in range(UserConfig.MAX_ACCOUNT_COUNT):
+                try:
+                    cm = ConnectionsManager.getInstance(ac)
+                    if cm:
+                        cm.setProxySettings(True, "127.0.0.1", int(port), "", "", "")
+                    try:
+                        prefs = MessagesController.getInstance(ac).getSharedPreferences("mainconfig", 0)
+                        if prefs:
+                            prefs.edit().putBoolean("proxy_enabled", True).putBoolean("proxy_enabled_calls", True).putBoolean("proxy_calls_enabled", True).commit()
+                    except:
+                        pass
+                    ok, reason = _check_proxy_tunnel(int(port), timeout=6.0)
+                    if ok:
+                        _log(f"profile_recheck: ac={ac} tunnel probe OK")
+                    else:
+                        _log(f"profile_recheck: ac={ac} tunnel probe FAIL: {reason}")
+                except Exception as e:
+                    _log(f"profile_recheck: ac={ac} error: {e}")
+        except Exception:
+            _log_exc("profile_recheck_once")
+
+    def _profile_recheck_loop(self):
+        while not self._profile_recheck_stop.is_set():
+            wait_sec = self._get_profile_recheck_interval_sec()
+            self._profile_recheck_stop.wait(wait_sec)
+            if self._profile_recheck_stop.is_set():
+                break
+            try:
+                if not self.get_setting("vless_enabled", True):
+                    continue
+                if not self._vless_running:
+                    continue
+                port = int(getattr(self, "_vless_port", 0) or 0)
+                if port <= 0:
+                    continue
+                self._profile_recheck_once(port)
+            except:
+                _log_exc("profile_recheck_loop")
+
+    def _check_proxy_alive(self, port):
+        try:
+            ok, reason = _check_proxy_tunnel(port, timeout=6.0)
+            _log(f"health_check: curl probe {'OK' if ok else 'FAIL'}: {reason}")
+            return bool(ok)
+        except:
+            return False
+
+    def _probe_node_connectivity(self, node, timeout=8.0):
+        try:
+            if not self._vless_core.is_available():
+                return 9999
+            uri = _sanitize_vless_uri(node.get("uri", ""))
+            if not uri:
+                return 9999
+            port = _get_free_port()
+            config_json, _ = VlessConfigParser.parse(uri, port)
+            if not config_json:
+                return 9999
+
+            start = time.monotonic()
+            with self._vless_start_lock:
+                try:
+                    self._vless_core.stop()
+                except:
+                    pass
+                err = self._vless_core.start(config_json)
+            if err:
+                _log(f"node_probe: start failed {node.get('name', '')}: {err}")
+                return 9999
+
+            try:
+                deadline = time.time() + float(VLESS_READY_WAIT_SEC)
+                while time.time() < deadline:
+                    if _check_vless_port(port, timeout=0.05):
+                        ok, reason = _check_proxy_tunnel(port, timeout=timeout)
+                        if ok:
+                            p = int((time.monotonic() - start) * 1000)
+                            _log(f"node_probe: OK {node.get('name', '')}: {reason} {p}ms")
+                            return p
+                        _log(f"node_probe: FAIL {node.get('name', '')}: {reason}")
+                        return 9999
+                    time.sleep(float(VLESS_READY_POLL_SEC))
+                _log(f"node_probe: port timeout {node.get('name', '')}")
+                return 9999
+            finally:
+                with self._vless_start_lock:
+                    try:
+                        self._vless_core.stop()
+                    except:
+                        pass
+        except Exception as e:
+            _log(f"node_probe error {node.get('name', '') if isinstance(node, dict) else ''}: {e}")
+            return 9999
+
+    def _ping_node_tcp(self, n):
+        try:
+            part = n["uri"].replace("vless://", "")
+            if "@" not in part: return 9999
+            host_port = part.split("@", 1)[1].split("?", 1)[0].split("#", 1)[0]
+            host, port_str = host_port.split(":", 1)
+            port = int(port_str)
+            try:
+                addrs = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+                if not addrs: raise Exception("no addr")
+                af, stype, proto, _, sa = addrs[0]
+            except:
+                return 9999
+            s = socket.socket(af, stype, proto)
+            try:
+                s.settimeout(1.5)
+                start = time.monotonic()
+                s.connect(sa)
+                return int((time.monotonic() - start) * 1000)
+            finally:
+                try: s.close()
+                except: pass
+        except:
+            return 9999
+
+    def _auto_switch_to_best(self):
+        try:
+            current_uri = self._vless_active_uri
+            all_nodes = list(self._vless_data.get("manual", []))
+            for sub in self._vless_data.get("subs", []):
+                all_nodes.extend(sub.get("nodes", []))
+            if len(all_nodes) < 2:
+                _log("auto_switch: not enough nodes to switch")
+                return
+            candidates = [n for n in all_nodes if n["uri"] != current_uri]
+            if not candidates:
+                _log("auto_switch: no candidates")
+                return
+            candidates.sort(key=lambda n: n.get("ping", 9999) if n.get("ping", -1) > 0 else 9999)
+            best = candidates[0]
+            best_ping = best.get("ping", -1)
+            if best_ping <= 0 or best_ping >= 9999:
+                _log("auto_switch: no reachable candidate")
+                return
+            _log(f"auto_switch: switching to {best['name']} ping={best_ping}ms")
+            self._vless_active_uri = best["uri"]
+            self._vless_save_data()
+            threading.Thread(target=self._vless_connect, daemon=True).start()
+            name = best.get("name", "")
+            msg = Z("auto_switch_notify").format(name=name)
+            run_on_ui_thread(lambda: BulletinHelper.show_success(msg))
+            run_on_ui_thread(self._reload_settings_ui)
+        except:
+            _log_exc("auto_switch error")
+
+    def _vless_pinger_loop(self):
+        while not self._ping_stop.is_set():
+            self._ping_event.clear()
+            try:
+                all_nodes = list(self._vless_data.get("manual", []))
+                for sub in self._vless_data.get("subs", []):
+                    all_nodes.extend(sub.get("nodes", []))
+                if not all_nodes:
+                    self._ping_event.wait(600); continue
+
+                if self._vless_core.is_available() and self._vless_running:
+                    changed = False
+                    active_uri = _sanitize_vless_uri(getattr(self, "_vless_running_uri", ""))
+                    active_port = int(getattr(self, "_vless_port", 0) or 0)
+                    for node in all_nodes:
+                        if _sanitize_vless_uri(node.get("uri", "")) == active_uri and active_port > 0:
+                            start = time.monotonic()
+                            ok, reason = _check_proxy_tunnel(active_port, timeout=8.0)
+                            p = int((time.monotonic() - start) * 1000) if ok else 9999
+                            _log(f"node_probe: active {'OK' if ok else 'FAIL'} {node.get('name', '')}: {reason}")
+                        else:
+                            p = self._ping_node_tcp(node)
+                        if node.get("ping") != p:
+                            node["ping"] = p; changed = True
+                    if changed:
+                        self._vless_save_data()
+                        run_on_ui_thread(self._reload_settings_ui)
+                    self._ping_event.wait(600)
+                    continue
+
+                if self._vless_core.is_available() and not self._vless_running:
+                    changed = False
+                    _log(f"node_probe: checking {len(all_nodes)} nodes via curl through proxy")
+                    for node in all_nodes:
+                        if self._ping_stop.is_set(): break
+                        p = self._probe_node_connectivity(node, timeout=8.0)
+                        if node.get("ping") != p:
+                            node["ping"] = p; changed = True
+                    if changed:
+                        self._vless_save_data()
+                        run_on_ui_thread(self._reload_settings_ui)
+                    self._ping_event.wait(600)
+                    continue
+
+                results = {}
+                lock = threading.Lock()
+
+                def _ping_one(n):
+                    p = self._ping_node_tcp(n)
+                    with lock:
+                        results[id(n)] = p
+
+                threads = []
+                for node in all_nodes:
+                    if self._ping_stop.is_set(): break
+                    t = threading.Thread(target=_ping_one, args=(node,), daemon=True)
+                    t.start()
+                    threads.append((t, node))
+
+                for t, node in threads:
+                    t.join(timeout=3.0)
+
+                changed = False
+                for t, node in threads:
+                    p = results.get(id(node))
+                    if p is None:
+                        p = 9999
+                    if node.get("ping") != p:
+                        node["ping"] = p; changed = True
+
+                if changed: self._vless_save_data()
+            except: pass
+            self._ping_event.wait(600)

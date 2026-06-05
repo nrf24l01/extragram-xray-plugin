@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+out/
+*.so
+*.zip
+*.sha256
+*.download
