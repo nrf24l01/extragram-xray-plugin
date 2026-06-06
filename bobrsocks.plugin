@@ -1645,6 +1645,19 @@ class bobrsocksPlugin(BasePlugin):
             except:
                 pass
 
+        def close_dialog_later(delay_ms=1200):
+            def _close():
+                try:
+                    b = dialog_box.get("builder")
+                    if b:
+                        b.dismiss()
+                except:
+                    pass
+            try:
+                run_on_ui_thread(_close, delay_ms)
+            except:
+                pass
+
         def set_progress(p, done=0, total=0, stage=""):
             try:
                 try:
@@ -1712,6 +1725,7 @@ class bobrsocksPlugin(BasePlugin):
                     try:
                         run_on_ui_thread(lambda: update_log_dialog("OK: " + Z("addon_download_done")))
                         run_on_ui_thread(lambda: BulletinHelper.show_success(Z("addon_download_done")))
+                        close_dialog_later()
                     except:
                         pass
             except Exception as e:
