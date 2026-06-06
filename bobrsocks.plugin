@@ -38,7 +38,6 @@ PROFILE_RECHECK_INTERVAL_SEC_MIN = 10.0
 PROXY_CHECK_URLS = (
     "https://api.ipify.org/",
     "https://ifconfig.me/ip",
-    "https://www.cloudflare.com/cdn-cgi/trace",
 )
 _PROXY_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://")
 MAIN_SETTINGS_ENTRY_TAG = "bobrsocks_main_settings_entry"
